@@ -12,14 +12,15 @@ type Manifest struct {
 	Libs     []string          `json:"libs"`
 	Packages map[string]string `json:"packages"`
 	Package  string            `json:"package,omitempty"`
+	Source   string            `json:"source,omitempty"`
 }
 
-func Path(appsDir, name string) string {
-	return filepath.Join(appsDir, name, "manifest.json")
+func Path(appDir string) string {
+	return filepath.Join(appDir, "manifest.json")
 }
 
-func Load(appsDir, name string) (*Manifest, error) {
-	data, err := os.ReadFile(Path(appsDir, name))
+func Load(appDir string) (*Manifest, error) {
+	data, err := os.ReadFile(Path(appDir))
 	if err != nil {
 		return nil, err
 	}
@@ -30,15 +31,15 @@ func Load(appsDir, name string) (*Manifest, error) {
 	return &m, nil
 }
 
-func Save(appsDir, name string, m *Manifest) error {
-	if err := os.MkdirAll(filepath.Join(appsDir, name), 0755); err != nil {
+func Save(appDir string, m *Manifest) error {
+	if err := os.MkdirAll(appDir, 0755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(Path(appsDir, name), data, 0644)
+	return os.WriteFile(Path(appDir), data, 0644)
 }
 
 func List(appsDir string) ([]*Manifest, error) {
@@ -51,7 +52,7 @@ func List(appsDir string) ([]*Manifest, error) {
 		if !e.IsDir() {
 			continue
 		}
-		m, err := Load(appsDir, e.Name())
+		m, err := Load(filepath.Join(appsDir, e.Name()))
 		if err == nil {
 			manifests = append(manifests, m)
 		}

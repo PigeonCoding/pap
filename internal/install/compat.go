@@ -7,29 +7,61 @@ import (
 	"strings"
 
 	"probe/internal/elf"
+	"probe/internal/resolver"
 )
 
 type compatChecker struct {
 	libsDir     string
 	verdefCache map[string]map[string]bool
+	visited     map[string]bool
 	problems    []string
 }
 
-func checkCompat(paths []string, libsDir string) error {
+// checkCompat walks DT_NEEDED recursively from root and verifies that every
+// non-host dependency exists, then checks symbol version requirements
+// (VERNEED) against the provider's VERDEF. Recursion only descends into
+// isolated libs; system libs are trusted as the running host's own.
+func checkCompat(root string, libsDir string) error {
 	c := &compatChecker{
 		libsDir:     libsDir,
 		verdefCache: map[string]map[string]bool{},
+		visited:     map[string]bool{},
 	}
-	for _, p := range paths {
-		c.check(p)
-	}
+	c.check(root)
 	if len(c.problems) == 0 {
 		return nil
 	}
-	return fmt.Errorf("symbol version compatibility:\n  %s", strings.Join(c.problems, "\n  "))
+	return fmt.Errorf("dependency compatibility:\n  %s", strings.Join(c.problems, "\n  "))
 }
 
 func (c *compatChecker) check(path string) {
+	if c.visited[path] {
+		return
+	}
+	c.visited[path] = true
+
+	info, err := elf.Parse(path)
+	if err != nil {
+		c.problems = append(c.problems, fmt.Sprintf("%s: %v", filepath.Base(path), err))
+		return
+	}
+	base := filepath.Base(path)
+
+	for _, n := range info.NEEDED {
+		if resolver.SkipLibs[n] {
+			continue
+		}
+		prov := c.provider(n)
+		if prov == "" {
+			c.problems = append(c.problems,
+				fmt.Sprintf("%s: missing dependency %s", base, n))
+			continue
+		}
+		if strings.HasPrefix(prov, c.libsDir+string(os.PathSeparator)) {
+			c.check(prov)
+		}
+	}
+
 	needs, err := elf.ParseVerneed(path)
 	if err != nil {
 		return
@@ -40,9 +72,7 @@ func (c *compatChecker) check(path string) {
 		}
 		prov := c.provider(vn.File)
 		if prov == "" {
-			c.problems = append(c.problems,
-				fmt.Sprintf("%s: no library found for %s", filepath.Base(path), vn.File))
-			continue
+			continue // already reported as a missing dependency above
 		}
 		defs := c.verdef(prov)
 		if defs == nil {
@@ -55,7 +85,7 @@ func (c *compatChecker) check(path string) {
 			if !defs[v.Name] {
 				c.problems = append(c.problems,
 					fmt.Sprintf("%s: %s requires %s not provided by %s",
-						filepath.Base(path), vn.File, v.Name, prov))
+						base, vn.File, v.Name, filepath.Base(prov)))
 			}
 		}
 	}
