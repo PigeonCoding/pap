@@ -11,6 +11,7 @@ var (
 	AppsDir     = filepath.Join(BaseDir, "apps")
 	StoreDir    = filepath.Join(BaseDir, "store")
 	PkgCacheDir = filepath.Join(BaseDir, "pkgcache")
+	Mirrorlist  = filepath.Join(BaseDir, "mirrorlist")
 	BinDir      = filepath.Join(filepath.Dir(BaseDir), ".local", "bin")
 	Arch        = hostArch()
 )

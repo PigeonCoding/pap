@@ -15,7 +15,8 @@ package database.
 input ELF
   │  readelf-equivalent: DT_NEEDED (recursive, BFS)
   ▼
-sonames ──► repo index (.db: core/extra/multilib/chaotic-aur, %PROVIDES% → soname map)
+sonames ──► repo index (.db: core/extra/multilib/chaotic-aur, %PROVIDES% → soname map;
+             undeclared sonames fall back to the .files index)
   ▼
 exact pkg name-version-arch ──► download from mirror (version-pinned URL)
   ▼
@@ -31,9 +32,11 @@ patchelf --force-rpath '$ORIGIN/libs'
   for. No `ldd` (it executes code), no `pacman -F`.
 - **Repositories**: official Arch repos (`core`, `extra`, `multilib`) plus
   `chaotic-aur` only — third-party repos from `pacman.conf` (cachyos,
-  lizardbyte, ...) are ignored. Servers come from the system mirrorlist /
-  `pacman.conf`; each repo's `.db` is cached with a TTL and downloads are
-  pinned to the mirror that served the index.
+  lizardbyte, ...) are ignored. Servers come from `~/.pap/mirrorlist` when it
+  exists (a pkg-only override for the official repos; chaotic-aur keeps its own
+  mirrors), else `pacman.conf` / the system mirrorlist; each repo's `.db` is
+  cached with a TTL and downloads are pinned to the mirror that served the
+  index.
 - **Version pinning + checksum**: the download URL is built from the exact
   `%FILENAME%` in the repo `.db` and the payload is verified against the
   index's `SHA256SUM`. Before anything is extracted, the archive's `.PKGINFO`
@@ -62,8 +65,9 @@ $HOME/.pap/
 ├── apps/<name>/
 │   ├── libs/             symlinks named by SONAME → store (per-app, saves space)
 │   └── manifest.json     libs + locked package versions (repo/name: version)
-└── store/
-    └── <sha256>          content-addressed (sha256 of file bytes), shared, GC-able
+├── store/
+│   └── <sha256>          content-addressed (sha256 of file bytes), shared, GC-able
+└── mirrorlist            optional pkg-only mirrors for core/extra/multilib
 ```
 
 ## Usage
@@ -102,8 +106,10 @@ into `~/.pap/apps/curl/libs/`.
 - **glibc and the ELF loader are not isolated** — the host provides
   `libc.so.6`, `libm`, `libpthread`, `ld-linux`, etc. The VERNEED check is the
   safety net: host glibc must satisfy the binary's symbol requirements.
-- **Only ELF with `SONAME` provides** — resolution relies on Arch packages
-  declaring `.so=` provides (all compliant Arch libs do).
+- **Every soname must map to a package that ships it** — packages declaring
+  `.so=` provides are preferred; sonames no package declares (e.g.
+  `libpython3.14.so.1.0`, which `python` ships without a provide) are looked up
+  in the repos' file indexes.
 - **`dlopen()` is partially covered** — plugin directories shipped under
   `usr/lib/` (ossl-modules, gconv, krb5 plugins, ...) are vendored with their
   relative layout, but absolute-path `dlopen` calls and plugins outside

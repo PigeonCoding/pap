@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -82,18 +83,23 @@ func Default() *Index {
 	return defaultIndex
 }
 
-// loadRepos builds the fixed repo set. Server lists come from pacman.conf
-// sections when present (so the user's mirror preference is respected);
-// chaotic-aur falls back to its official mirrors, other repos to
-// /etc/pacman.d/mirrorlist.
+// loadRepos builds the fixed repo set. Server lists come from a pkg-only
+// mirrorlist (~/.pap/mirrorlist) when present, so the official Arch repos can
+// be pinned without touching the system; otherwise from pacman.conf sections
+// (so the user's mirror preference is respected), then
+// /etc/pacman.d/mirrorlist. chaotic-aur is never served by the Arch mirrors
+// and keeps its own servers.
 func loadRepos() []repoDef {
 	conf := parsePacmanConf()
 	mirrors := loadMirrors()
+	custom := mirrorlistServers(config.Mirrorlist)
 
 	var defs []repoDef
 	for _, name := range wantedRepos {
 		var servers []string
 		switch {
+		case name != "chaotic-aur" && len(custom) > 0:
+			servers = custom
 		case len(conf[name]) > 0:
 			servers = conf[name]
 		case name == "chaotic-aur":
@@ -701,14 +707,16 @@ func (idx *Index) defFor(repoName string) (repoDef, bool) {
 }
 
 // orderedServers returns the mirror that served the .db first, then the
-// repo's remaining servers, so a download can't silently mix snapshots.
+// repo's remaining servers, so a download can't silently mix snapshots. A pin
+// from a mirror that is no longer configured (mirrorlist edited) is dropped,
+// so a changed mirror preference applies immediately.
 func (idx *Index) orderedServers(def repoDef) []string {
 	var pinned string
 	if b, err := os.ReadFile(idx.serverFile(def.name)); err == nil {
 		pinned = strings.TrimSpace(string(b))
 	}
 	var out []string
-	if pinned != "" {
+	if pinned != "" && slices.Contains(def.servers, pinned) {
 		out = append(out, pinned)
 	}
 	for _, s := range def.servers {

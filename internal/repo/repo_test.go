@@ -6,7 +6,10 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+
+	"probe/internal/config"
 )
 
 type tarEntry struct{ name, body string }
@@ -121,5 +124,55 @@ func TestProvidersFallsBackToFileIndex(t *testing.T) {
 	}
 	if _, err := idx.Resolve("libnothing.so.9"); err == nil {
 		t.Error("Resolve(libnothing.so.9) = nil error, want failure")
+	}
+}
+
+func TestLoadReposPrefersCustomMirrorlist(t *testing.T) {
+	want := []string{
+		"https://fastly.example/$repo/os/$arch",
+		"https://geo.example/$repo/os/$arch",
+	}
+	file := filepath.Join(t.TempDir(), "mirrorlist")
+	body := "#Server = https://commented-out/\n"
+	for _, s := range want {
+		body += "Server = " + s + "\n"
+	}
+	if err := os.WriteFile(file, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	orig := config.Mirrorlist
+	config.Mirrorlist = file
+	t.Cleanup(func() { config.Mirrorlist = orig })
+
+	byName := map[string][]string{}
+	for _, d := range loadRepos() {
+		byName[d.name] = d.servers
+	}
+	for _, name := range []string{"core", "extra", "multilib"} {
+		if !slices.Equal(byName[name], want) {
+			t.Errorf("%s servers = %v, want %v", name, byName[name], want)
+		}
+	}
+	if slices.Contains(byName["chaotic-aur"], want[0]) {
+		t.Errorf("chaotic-aur servers = %v, must not use the Arch mirrors", byName["chaotic-aur"])
+	}
+}
+
+func TestOrderedServersDropsStalePin(t *testing.T) {
+	idx := &Index{cacheDir: t.TempDir()}
+	def := repoDef{name: "core", servers: []string{"https://new.example/$repo/os/$arch"}}
+
+	if err := os.WriteFile(idx.serverFile("core"), []byte("https://old.example/$repo/os/$arch"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.orderedServers(def); !slices.Equal(got, def.servers) {
+		t.Errorf("stale pin: orderedServers = %v, want %v", got, def.servers)
+	}
+
+	if err := os.WriteFile(idx.serverFile("core"), []byte(def.servers[0]), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.orderedServers(def); !slices.Equal(got, def.servers) {
+		t.Errorf("current pin: orderedServers = %v, want %v", got, def.servers)
 	}
 }
