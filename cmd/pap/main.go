@@ -22,7 +22,6 @@ func main() {
 	force := false
 	dryRun := false
 	quiet := false
-	addPath := false
 	archiveDate := ""
 	noArchive := false
 	pkgVersion := ""
@@ -74,10 +73,11 @@ func main() {
 			dryRun = true
 		case "--quiet", "-q":
 			quiet = true
-		case "--add-path":
-			addPath = true
 		case "--no-archive":
 			noArchive = true
+		case "--add-path":
+			fmt.Fprintf(os.Stderr, "--add-path is a command now: %s add-path\n", os.Args[0])
+			os.Exit(1)
 		case "--version", "-V":
 			fmt.Printf("pap %s (arch %s)\n", install.Version, config.Arch)
 			return
@@ -96,13 +96,13 @@ func main() {
 		os.Exit(1)
 	}
 	opts := func() install.InstallOptions {
-		return install.InstallOptions{Force: force, DryRun: dryRun, Quiet: quiet, AddPath: addPath, ArchiveDate: archiveDate, NoArchive: noArchive}
+		return install.InstallOptions{Force: force, DryRun: dryRun, Quiet: quiet, ArchiveDate: archiveDate, NoArchive: noArchive}
 	}
 
 	switch cmd {
 	case "install":
 		if len(pos) < 1 || len(pos) > 2 {
-			fmt.Fprintf(os.Stderr, "usage: %s install [--force] [--dry-run] [--quiet] [--add-path] [--pkg-version <ver>] [--archive-date YYYY-MM-DD] [--no-archive] <pkg> [name]\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "usage: %s install [--force] [--dry-run] [--quiet] [--pkg-version <ver>] [--archive-date YYYY-MM-DD] [--no-archive] <pkg> [name]\n", os.Args[0])
 			os.Exit(1)
 		}
 		if err := validPkgName(pos[0]); err != nil {
@@ -143,6 +143,14 @@ func main() {
 			os.Exit(1)
 		}
 		if err := install.Uninstall(pos[0]); err != nil {
+			fail(err)
+		}
+	case "add-path":
+		if len(pos) > 0 {
+			fmt.Fprintf(os.Stderr, "usage: %s add-path\n", os.Args[0])
+			os.Exit(1)
+		}
+		if err := install.AddPath(); err != nil {
 			fail(err)
 		}
 	case "gc":
@@ -194,7 +202,7 @@ func validPkgName(pkg string) error {
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: %s <command> [args...]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "\ncommands:\n")
-	fmt.Fprintf(os.Stderr, "  install [--force] [--dry-run] [--quiet] [--add-path] [--pkg-version <ver>] [--archive-date YYYY-MM-DD] [--no-archive] <pkg> [name]  Install an app package from the Arch repos with isolated libs\n")
+	fmt.Fprintf(os.Stderr, "  install [--force] [--dry-run] [--quiet] [--pkg-version <ver>] [--archive-date YYYY-MM-DD] [--no-archive] <pkg> [name]  Install an app package from the Arch repos with isolated libs\n")
 	fmt.Fprintf(os.Stderr, "      <pkg> is a repo package name; [name] overrides the installed app name.\n")
 	fmt.Fprintf(os.Stderr, "      --pkg-version <ver> pins an exact pkgver, fetched from the Arch Linux\n")
 	fmt.Fprintf(os.Stderr, "        Archive when the mirrors no longer carry it.\n")
@@ -204,11 +212,12 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "  reinstall <name>                     Reinstall from source, pinned to manifest versions\n")
 	fmt.Fprintf(os.Stderr, "  upgrade <name>                       Reinstall from source, re-resolving to current versions\n")
 	fmt.Fprintf(os.Stderr, "  uninstall <name>                     Remove an installed app (only removes binaries we placed)\n")
+	fmt.Fprintf(os.Stderr, "  add-path                             Append the bin dir to your shell rc so it stays on PATH\n")
 	fmt.Fprintf(os.Stderr, "  gc                                   Garbage-collect unused store entries\n")
 	fmt.Fprintf(os.Stderr, "  list                                 List installed apps\n")
 	fmt.Fprintf(os.Stderr, "  info <name>                          Show app manifest, source and pinned versions\n")
 	fmt.Fprintf(os.Stderr, "  doctor                               Check bsdtar/patchelf and state dirs\n")
 	fmt.Fprintf(os.Stderr, "  version                              Print version\n")
-	fmt.Fprintf(os.Stderr, "\nflags (install/reinstall/upgrade): --force/-f, --dry-run/-n, --quiet/-q, --add-path, --pkg-version, --archive-date, --no-archive\n")
+	fmt.Fprintf(os.Stderr, "\nflags (install/reinstall/upgrade): --force/-f, --dry-run/-n, --quiet/-q, --pkg-version, --archive-date, --no-archive\n")
 	fmt.Fprintf(os.Stderr, "env: PAP_HOME overrides ~/.pap (isolation), PAP_BIN_DIR overrides bin dir\n")
 }

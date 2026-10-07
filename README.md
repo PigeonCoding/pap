@@ -19,9 +19,10 @@ State lives in `~/.pap` (`PAP_HOME` overrides it).
 ```sh
 go build -o pap ./cmd/pap
 
-pap install [--force] [--dry-run] [--quiet] [--add-path] [--pkg-version <ver>] <pkg> [name]
+pap install [--force] [--dry-run] [--quiet] [--pkg-version <ver>] <pkg> [name]
 pap reinstall <name>   # re-fetch the pinned package version
 pap upgrade <name>     # re-resolve to the live latest package version
+pap add-path           # append ~/.local/bin to your shell rc
 pap list | pap info <name> | pap uninstall <name> | pap gc | pap doctor | pap version
 ```
 
@@ -57,7 +58,7 @@ Done. Run: /home/user/.local/bin/curl-old
   (transitive deps need `RPATH`, not `RUNPATH`); vendored libs with their own
   `RUNPATH` are rewritten to `$ORIGIN`.
 - `~/.local/bin/<name>` is a symlink to the real binary. Shell rc is never
-  edited unless you pass `--add-path`.
+  edited unless you run `pap add-path`.
 
 ```
 ~/.local/bin/<name>   →  ~/.pap/exe/<name>/… (on PATH)

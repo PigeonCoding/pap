@@ -31,7 +31,6 @@ type InstallOptions struct {
 	Locked      map[string]string // exact "repo/name" -> version lock (reinstall)
 	DryRun      bool              // resolve and print plan without modifying apps/bin
 	Quiet       bool              // suppress progress output
-	AddPath     bool              // allow appending ~/.local/bin to shell rc
 	Exe         string            // payload installs: explicit main executable, relative to the payload root
 	Out         io.Writer         // progress output (nil = stdout)
 	ArchiveDate string            // YYYY-MM-DD snapshot for ALA fallback ("" = auto from ELF mtime)
@@ -678,7 +677,7 @@ func finishInstall(stg *stager, name, exeRel string, opts InstallOptions) error 
 	commitPlacedBinary(name)
 	committed = true
 
-	ensurePath(opts.AddPath)
+	hintPath()
 	opts.printf("\nDone. Run: %s\n", filepath.Join(config.BinDir, name))
 	return nil
 }
@@ -2162,37 +2161,43 @@ func removePlacedBinary(name string) bool {
 	return removed
 }
 
-// ensurePath is opt-in: with addPath=false it only prints a hint.
-// With addPath=true it appends an export to the first existing rc file.
-func ensurePath(addPath bool) {
-	inSession := false
+// binDirInSession reports whether config.BinDir is already on this shell's PATH.
+func binDirInSession() bool {
 	for _, p := range filepath.SplitList(os.Getenv("PATH")) {
 		if filepath.Clean(p) == config.BinDir {
-			inSession = true
-			break
+			return true
 		}
 	}
+	return false
+}
 
-	if !addPath {
-		if !inSession && !rcMentionsLocalBin() {
-			fmt.Printf("Note: %s is not on PATH; run with --add-path to append it to your shell rc, or: export PATH=\"$HOME/.local/bin:$PATH\"\n", config.BinDir)
-		} else if !inSession {
-			fmt.Printf("Note: %s is not in this shell's PATH; run: export PATH=\"$HOME/.local/bin:$PATH\"\n", config.BinDir)
-		}
+// hintPath only tells the user how to get the bin dir on PATH; it never
+// edits a shell rc file (that is AddPath's job).
+func hintPath() {
+	if binDirInSession() {
 		return
 	}
-
-	var rcAdded string
 	if !rcMentionsLocalBin() {
-		rcAdded = appendLocalBinToRc()
+		fmt.Printf("Note: %s is not on PATH; run `pap add-path` to append it to your shell rc, or: export PATH=\"%s:$PATH\"\n", config.BinDir, config.BinDir)
+	} else {
+		fmt.Printf("Note: %s is not in this shell's PATH; run: export PATH=\"%s:$PATH\"\n", config.BinDir, config.BinDir)
 	}
+}
 
-	switch {
-	case rcAdded != "":
-		fmt.Printf("Note: added %s to PATH in %s (restart your shell)\n", config.BinDir, rcAdded)
-	case !inSession:
-		fmt.Printf("Note: %s is not in this shell's PATH; run: export PATH=\"$HOME/.local/bin:$PATH\"\n", config.BinDir)
+// AddPath appends the bin dir to the first existing shell rc file. It is
+// idempotent: an rc that already mentions the dir is left alone.
+func AddPath() error {
+	if rcMentionsLocalBin() {
+		fmt.Printf("Note: %s is already referenced in your shell rc\n", config.BinDir)
+	} else if rc := appendLocalBinToRc(); rc != "" {
+		fmt.Printf("Note: added %s to PATH in %s (restart your shell)\n", config.BinDir, rc)
+	} else {
+		return fmt.Errorf("could not append %s to any shell rc file", config.BinDir)
 	}
+	if !binDirInSession() {
+		fmt.Printf("Note: %s is not in this shell's PATH; run: export PATH=\"%s:$PATH\"\n", config.BinDir, config.BinDir)
+	}
+	return nil
 }
 
 func rcCandidates() []string {
