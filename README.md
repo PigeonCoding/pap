@@ -40,7 +40,7 @@ $ wget https://github.com/kovidgoyal/kitty/releases/download/v0.49.2/kitty-0.49.
 $ mkdir kitty
 $ cd kitty
 $ tar xvf ../kitty-0.49.2-x86_64.txz
-$ ➜  probe ./pap/pap install --add-path ./kitty --exe bin/kitty kitty
+$ pap install --add-path . --exe bin/kitty kitty
 Installing kitty from kitty (main executable: bin/kitty)
 Direct NEEDED: [libpython3.14.so.1.0 libc.so.6]
 Copying folder...
