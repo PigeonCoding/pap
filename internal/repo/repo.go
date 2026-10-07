@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"probe/internal/config"
+	"pap/internal/config"
 )
 
 const dbTTL = 6 * time.Hour
@@ -40,6 +40,7 @@ type repoDef struct {
 
 type Index struct {
 	mu          sync.RWMutex
+	loadMu      sync.Mutex
 	fileMap     map[string][]PkgInfo
 	pkgMeta     map[string]PkgInfo // "repo/name" -> package index metadata
 	repos       []repoDef
@@ -71,16 +72,61 @@ var chaoticServers = []string{
 }
 
 func Default() *Index {
+	if testOverride != nil {
+		return testOverride
+	}
 	once.Do(func() {
-		defaultIndex = &Index{
-			fileMap:     make(map[string][]PkgInfo),
-			pkgMeta:     make(map[string]PkgInfo),
-			repos:       loadRepos(),
-			cacheDir:    filepath.Join(os.TempDir(), "arch-repo-cache"),
-			pkgCacheDir: config.PkgCacheDir,
-		}
+		defaultIndex = New(config.RepoCacheDir, config.PkgCacheDir)
 	})
+	// PAP_HOME isolation: rebuild the singleton when config dirs moved
+	// under us (tests set PAP_HOME + config.Refresh).
+	if defaultIndex != nil && (defaultIndex.cacheDir != config.RepoCacheDir || defaultIndex.pkgCacheDir != config.PkgCacheDir) {
+		ResetDefault()
+		once.Do(func() {
+			defaultIndex = New(config.RepoCacheDir, config.PkgCacheDir)
+		})
+	}
 	return defaultIndex
+}
+
+// testOverride lets e2e tests inject an httptest-backed index.
+var testOverride *Index
+
+// OverrideDefault swaps the singleton (tests only); pass nil to restore.
+func OverrideDefault(idx *Index) { testOverride = idx }
+
+// New builds an index backed by cacheDir (repo .db/.files) and pkgCacheDir
+// (downloaded packages). Repos are resolved from pacman.conf/mirrorlist.
+func New(cacheDir, pkgCacheDir string) *Index {
+	return NewWithRepos(loadRepos(), cacheDir, pkgCacheDir)
+}
+
+// NewWithRepos builds an index over an explicit repo set (tests, httptest).
+func NewWithRepos(repos []repoDef, cacheDir, pkgCacheDir string) *Index {
+	return &Index{
+		fileMap:     make(map[string][]PkgInfo),
+		pkgMeta:     make(map[string]PkgInfo),
+		repos:       repos,
+		cacheDir:    cacheDir,
+		pkgCacheDir: pkgCacheDir,
+	}
+}
+
+// NewTestRepo builds a single-repo index pointing at serverURL (httptest).
+func NewTestRepo(repoName, serverURL, cacheDir, pkgCacheDir string) *Index {
+	return NewWithRepos([]repoDef{{name: repoName, servers: []string{serverURL}}}, cacheDir, pkgCacheDir)
+}
+
+// ResetDefault drops the singleton (tests only).
+func ResetDefault() {
+	once = sync.Once{}
+	defaultIndex = nil
+}
+
+// optionalRepo marks repos whose absence must not spam errors: some mirrors
+// and installs have no multilib, and chaotic-aur is best-effort.
+func optionalRepo(name string) bool {
+	return name == "multilib" || name == "chaotic-aur"
 }
 
 // loadRepos builds the fixed repo set. Server lists come from a pkg-only
@@ -211,9 +257,20 @@ func (idx *Index) Load() error {
 	if done {
 		return nil
 	}
+	idx.loadMu.Lock()
+	defer idx.loadMu.Unlock()
+	// Double-check after acquiring the load mutex.
+	idx.mu.RLock()
+	done = idx.loaded
+	idx.mu.RUnlock()
+	if done {
+		return nil
+	}
 
 	os.MkdirAll(idx.cacheDir, 0755)
-	os.MkdirAll(idx.pkgCacheDir, 0755)
+	if idx.pkgCacheDir != "" {
+		os.MkdirAll(idx.pkgCacheDir, 0755)
+	}
 
 	var wg sync.WaitGroup
 	errs := make([]error, len(idx.repos))
@@ -228,19 +285,37 @@ func (idx *Index) Load() error {
 
 	// Parse sequentially in pacman.conf order so provider priority is
 	// deterministic and matches pacman's own repo priority.
+	parsed := 0
 	for i, def := range idx.repos {
 		if errs[i] != nil {
-			fmt.Fprintf(os.Stderr, "repo %s: %v\n", def.name, errs[i])
+			// Optional repos (multilib on single-arch mirrors,
+			// chaotic-aur on restricted networks) fail quietly when a
+			// stale cache exists; otherwise warn once, not on every
+			// install — Load runs once per process.
+			if optionalRepo(def.name) && validIndex(idx.indexFile(def.name, "db")) {
+				continue
+			}
+			if optionalRepo(def.name) {
+				fmt.Fprintf(os.Stderr, "warning: repo %s unavailable, skipping: %v\n", def.name, errs[i])
+			} else {
+				fmt.Fprintf(os.Stderr, "repo %s: %v\n", def.name, errs[i])
+			}
 			continue
 		}
 		if err := idx.parseDb(def.name); err != nil {
 			fmt.Fprintf(os.Stderr, "repo %s: parse: %v\n", def.name, err)
+			continue
 		}
+		parsed++
 	}
 
 	idx.mu.Lock()
 	idx.loaded = true
+	empty := len(idx.fileMap) == 0 && len(idx.pkgMeta) == 0
 	idx.mu.Unlock()
+	if empty {
+		return fmt.Errorf("no repo index available (tried %d repos, parsed %d); check network/mirrors", len(idx.repos), parsed)
+	}
 	return nil
 }
 
@@ -264,6 +339,9 @@ func (idx *Index) fetchIndex(def repoDef, kind string) error {
 	if validIndex(file) && !mtimeOlder(file, dbTTL) {
 		return nil
 	}
+	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil {
+		return err
+	}
 
 	servers := def.servers
 	if kind == "files" {
@@ -272,9 +350,19 @@ func (idx *Index) fetchIndex(def repoDef, kind string) error {
 
 	var lastErr error
 	for _, srv := range servers {
-		tmp := file + ".tmp"
+		// Unpredictable temp name in the same dir (same filesystem for
+		// rename) — no fixed ".tmp" that a concurrent run or another
+		// user could plant/symlink.
+		tmpF, err := os.CreateTemp(filepath.Dir(file), ".dl-*")
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		tmp := tmpF.Name()
+		tmpF.Close()
 		os.Remove(tmp)
 		if err := fetch(indexURL(srv, def.name, kind), tmp); err != nil {
+			os.Remove(tmp)
 			lastErr = err
 			continue
 		}
@@ -283,7 +371,11 @@ func (idx *Index) fetchIndex(def repoDef, kind string) error {
 			lastErr = fmt.Errorf("invalid index from %s", indexURL(srv, def.name, kind))
 			continue
 		}
-		os.Rename(tmp, file)
+		if err := os.Rename(tmp, file); err != nil {
+			os.Remove(tmp)
+			lastErr = err
+			continue
+		}
 		if kind == "db" {
 			os.WriteFile(idx.serverFile(def.name), []byte(srv), 0644)
 		}
@@ -391,6 +483,8 @@ func (idx *Index) parseDesc(repoName, desc string) {
 	if !ok {
 		return
 	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
 	idx.pkgMeta[repoName+"/"+info.Name] = info
 
 	for _, soname := range parseProvides(desc) {
@@ -748,13 +842,22 @@ func (idx *Index) pkgFileName(pkg PkgInfo) string {
 
 // Download fetches the exact package recorded in the index, verified against
 // the index's SHA256. Downloads are cached on disk keyed by filename.
+// The payload is streamed to a temp file (not buffered as one []byte on
+// the wire); the returned slice is read back from the verified cache file.
 func (idx *Index) Download(pkg PkgInfo) ([]byte, error) {
 	fn := idx.pkgFileName(pkg)
 	if fn == "" {
 		return nil, fmt.Errorf("bad filename for %s %s", pkg.Name, pkg.Version)
 	}
+	pkgCache := idx.pkgCacheDir
+	if pkgCache == "" {
+		pkgCache = idx.cacheDir
+	}
+	if err := os.MkdirAll(pkgCache, 0755); err != nil {
+		return nil, err
+	}
 
-	cacheFile := filepath.Join(idx.pkgCacheDir, fn)
+	cacheFile := filepath.Join(pkgCache, fn)
 	if data, err := os.ReadFile(cacheFile); err == nil {
 		if pkg.SHA256 == "" || sha256hex(data) == pkg.SHA256 {
 			return data, nil
@@ -762,35 +865,99 @@ func (idx *Index) Download(pkg PkgInfo) ([]byte, error) {
 		os.Remove(cacheFile)
 	}
 
+	tmp, err := idx.downloadToTemp(pkg, fn)
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp)
+	if err := os.Rename(tmp, cacheFile); err != nil {
+		// Cache write is best-effort (e.g. concurrent downloader won).
+		if data, rerr := os.ReadFile(cacheFile); rerr == nil {
+			if pkg.SHA256 == "" || sha256hex(data) == pkg.SHA256 {
+				return data, nil
+			}
+		}
+		fmt.Fprintf(os.Stderr, "warning: pkg cache write: %v\n", err)
+	}
+	return os.ReadFile(tmpOr(cacheFile, tmp))
+}
+
+func tmpOr(a, b string) string {
+	if _, err := os.Stat(a); err == nil {
+		return a
+	}
+	return b
+}
+
+// DownloadToFile streams the package to dest (verified against SHA256),
+// using the on-disk cache when it already holds the exact file.
+func (idx *Index) DownloadToFile(pkg PkgInfo, dest string) error {
+	fn := idx.pkgFileName(pkg)
+	if fn == "" {
+		return fmt.Errorf("bad filename for %s %s", pkg.Name, pkg.Version)
+	}
+	pkgCache := idx.pkgCacheDir
+	if pkgCache == "" {
+		pkgCache = idx.cacheDir
+	}
+	if err := os.MkdirAll(pkgCache, 0755); err != nil {
+		return err
+	}
+	cacheFile := filepath.Join(pkgCache, fn)
+	if st, err := os.Stat(cacheFile); err == nil && st.Size() > 0 {
+		if ok, _ := verifyFileSHA256(cacheFile, pkg.SHA256); ok {
+			return copyFile(dest, cacheFile)
+		}
+		os.Remove(cacheFile)
+	}
+	tmp, err := idx.downloadToTemp(pkg, fn)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	if err := copyFile(cacheFile, tmp); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: pkg cache write: %v\n", err)
+	}
+	return copyFile(dest, tmp)
+}
+
+func (idx *Index) downloadToTemp(pkg PkgInfo, fn string) (string, error) {
 	def, ok := idx.defFor(pkg.Repo)
 	if !ok {
-		return nil, fmt.Errorf("unknown repo %q", pkg.Repo)
+		return "", fmt.Errorf("unknown repo %q", pkg.Repo)
 	}
-
+	pkgCache := idx.pkgCacheDir
+	if pkgCache == "" {
+		pkgCache = idx.cacheDir
+	}
+	if err := os.MkdirAll(pkgCache, 0755); err != nil {
+		return "", err
+	}
 	servers := idx.orderedServers(def)
 	var lastErr error
 	for i, srv := range servers {
 		if i > 0 {
 			fmt.Fprintf(os.Stderr, "warning: %s: trying fallback mirror %s\n", fn, srv)
 		}
-		data, err := get(idx.pkgURL(srv, pkg))
+		tmpF, err := os.CreateTemp(pkgCache, ".dl-*")
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		if sum := pkg.SHA256; sum != "" && sha256hex(data) != sum {
-			lastErr = fmt.Errorf("checksum mismatch for %s from %s", fn, srv)
+		tmp := tmpF.Name()
+		tmpF.Close()
+		os.Remove(tmp)
+		if err := fetchTo(idx.pkgURL(srv, pkg), tmp, pkg.SHA256); err != nil {
+			os.Remove(tmp)
+			lastErr = err
 			continue
 		}
-		if err := atomicWrite(cacheFile, data); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: pkg cache write: %v\n", err)
-		}
-		return data, nil
+		return tmp, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no servers for repo %s", pkg.Repo)
 	}
-	return nil, fmt.Errorf("download %s: %w", fn, lastErr)
+	return "", fmt.Errorf("download %s: %w", fn, lastErr)
 }
 
 func sha256hex(data []byte) string {
@@ -798,12 +965,71 @@ func sha256hex(data []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-func atomicWrite(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+func verifyFileSHA256(path, want string) (bool, error) {
+	if want == "" {
+		return true, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err
+	}
+	return hex.EncodeToString(h.Sum(nil)) == want, nil
+}
+
+func copyFile(dst, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	out, err := os.CreateTemp(filepath.Dir(dst), ".cp-*")
+	if err != nil {
+		return err
+	}
+	tmp := out.Name()
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
+func atomicWrite(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Chmod(name, 0644); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 func get(url string) ([]byte, error) {
@@ -819,6 +1045,11 @@ func get(url string) ([]byte, error) {
 }
 
 func fetch(url, dest string) error {
+	return fetchTo(url, dest, "")
+}
+
+// fetchTo streams url to dest, optionally verifying SHA256 while writing.
+func fetchTo(url, dest, wantSHA string) error {
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		return err
@@ -827,13 +1058,29 @@ func fetch(url, dest string) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
 	}
-	f, err := os.Create(dest)
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		return err
+	}
+	// O_EXCL: never truncate a file another process placed.
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	h := sha256.New()
+	w := io.Writer(f)
+	if wantSHA != "" {
+		w = io.MultiWriter(f, h)
+	}
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		os.Remove(dest)
+		return err
+	}
+	if wantSHA != "" && hex.EncodeToString(h.Sum(nil)) != wantSHA {
+		os.Remove(dest)
+		return fmt.Errorf("checksum mismatch for %s from %s", filepath.Base(dest), url)
+	}
+	return nil
 }
 
 func mtimeOlder(path string, d time.Duration) bool {

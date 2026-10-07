@@ -1,3 +1,3 @@
-module probe
+module pap
 
 go 1.27.1

@@ -9,7 +9,7 @@ import (
 	"slices"
 	"testing"
 
-	"probe/internal/config"
+	"pap/internal/config"
 )
 
 type tarEntry struct{ name, body string }

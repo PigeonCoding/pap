@@ -2,107 +2,95 @@
 
 ## Correctness (will bite us)
 
-- [x] **Hard-fail unresolved sonames** — resolve loop currently only warns and
-  `continue`s; install must abort if any `DT_NEEDED` can't be satisfied instead
-  of producing a broken app (`internal/install/install.go`).
-- [x] **Hash-only store keys** — `store.Store()` keys `<sha256>-<filename>`,
-  so identical content under `libcap.so`/`libcap.so.2`/`libcap.so.2.78` is
-  stored 3×. Store as `<sha256>` only; the symlink name carries the SONAME
-  (`internal/store/store.go`).
-- [x] **Compat check must walk `DT_NEEDED` for file existence** — VERNEED is
-  empty for unversioned-symbol libs, so a missing lib is invisible to the
-  check. Existence check via recursive `DT_NEEDED`, VERNEED only for versions
-  (`internal/install/compat.go`).
-- [x] **Pin all downloads to the mirror that served the `.db`** — per-file
-  mirror fallback can assemble one app from two mirror snapshots
-  (`internal/repo/repo.go`).
-- [x] **Read repo set from `pacman.conf`** — hardcoded `core, extra,
-  multilib` ignores custom repos (system runs CachyOS v3; already saw
-  `ncurses 6.6-2` resolved vs installed `6.6-2.1`)
-  (`internal/repo/repo.go`).
-- [x] **`.db` cache TTL** — currently never refetched unless gzip-invalid;
-  stale index 404s once mirrors prune old versions. Add expiry (ETag /
-  If-Modified-Since or mtime TTL) (`internal/repo/repo.go`).
-- [x] **Use `%FILENAME%` from `.db`** instead of reconstructing
-  `name-version-arch` for download URLs (epoch/arch quirks)
-  (`internal/repo/repo.go`).
-- [x] **Support non-`=` provides** — `provideToSoname` skips bare
-  `libfoo.so.1` provides; accept them (`internal/repo/repo.go`).
-- [x] **Retry alternate providers** — when the chosen package doesn't contain
-  the requested soname, try the next candidate from the index before failing
-  (`internal/repo/repo.go`, `internal/install/install.go`).
-
-## Isolation completeness
-
-- [x] **Patchelf every vendored lib** — a lib's own `DT_RUNPATH` takes
-  precedence over the exe's `DT_RPATH` and leaks to system libs. Set
-  `--force-rpath --set-rpath '$ORIGIN'` on each extracted lib too
-  (`internal/install/install.go`).
-- [x] **Remove `libstdc++`/`libgcc_s` from the skip list** — unlike glibc
-  they are isolatable; currently C++ binaries from newer toolchains fail
-  VERNEED with no remedy (`internal/resolver/resolver.go`).
-- [x] **Vendor plugin dirs from packages** — top-level `usr/lib/` filename
-  filter drops `ossl-modules/`, gconv, NSS subdirs even when shipped
-  (`internal/install/install.go`).
+- [x] **Fix `--force` failure destroying the previous install** — `placeBinary`
+  runs before `publish` (`internal/install/install.go:251`, `:260`); on failure
+  the rollback removes the new binary but the old one was already overwritten
+  by `moveFile`. `publish` also does `os.RemoveAll(final)` before `rename`
+  (`install.go:355`) — rename to `.bak`, swap, then delete.
+- [x] **Make `SkipLibs` arch-aware and complete** — hardcoded x86_64 list
+  (`internal/resolver/resolver.go:9`): `ld-linux-aarch64.so.1` missing so
+  aarch64 support never works; `libutil/libcrypt/libnsl/libanl/libmvec/
+  libthread_db/libnss_*` missing → unresolvable sonames hard-fail. Derive the
+  host-provided set dynamically from the host `ld-linux` → `libc.so.6` NEEDED
+  closure instead of a hand-written list.
+- [x] **Fix `Index.Load` races** — `parseDb` writes `fileMap` unlocked and the
+  `loaded` check (`internal/repo/repo.go:193`) is non-atomic; `Load` returns
+  `nil` even when every repo failed (`repo.go:227`), yielding misleading
+  "no package provides" errors — fail fast on an empty index. Missing optional
+  repos (no `multilib`) print errors on every install (`repo.go:219`).
+- [x] **Add a cross-process lock** — concurrent `pkg` runs race on `publish`,
+  stage pruning, and `atomicWrite`'s fixed `.tmp` name
+  (`internal/repo/repo.go:548`). `flock` on `~/.pap/lock` covers all of it.
+- [x] **Make config injectable** — package-level `config` vars + the
+  `repo.Default()` singleton make the install path untestable. Support
+  `PAP_HOME` (or pass a config struct) and give `Index` a constructor.
 
 ## Security
 
-- [x] **Verify SHA256 from `.db` desc** — currently only `.PKGINFO`
-  self-consistency (attacker-controlled). Check the archive against the
-  checksum recorded in the repo index (`internal/repo/repo.go`,
-  `internal/install/install.go`).
-- [x] **Download timeouts** — a hanging mirror blocks the install forever;
-  use an `http.Client` with timeout (`internal/repo/repo.go`).
+- [x] **Move the repo cache out of `/tmp`** — `filepath.Join(os.TempDir(),
+  "arch-repo-cache")` (`internal/repo/repo.go:70`) is predictable and
+  world-writable: index planting / symlink attacks via fixed `.tmp` names.
+  Use XDG `~/.cache/pap` + `os.CreateTemp`.
+- [x] **Package signature verification** — SHA256 comes from the mirror-served
+  index; pacman would check SigLevel/keyring. Verify `.sig` against
+  `/etc/pacman.d/keyring`, or document the threat model explicitly.
+- [x] **Preserve file modes** — `store.Store` chmods everything 0755
+  (`internal/store/store.go:51`) and `copyFile` ignores the source mode
+  (`internal/install/install.go:742`).
 
-## Robustness / UX
+## Tests / CI
 
-- [x] **Read the lock on reinstall** — `manifest.json` records exact
-  versions but nothing consumes them; add `reinstall --locked` and an
-  `upgrade` command (`internal/manifest/manifest.go`, `cmd/pkg`).
-- [x] **Package download cache** — `pkgCache` is in-memory per run; persist
-  downloaded packages (keyed by `%FILENAME%`) so reinstalls don't re-fetch
-  bytes already in the store.
-- [x] **Atomic store writes** — `os.WriteFile` straight to the final
-  hash-named path: crash leaves a truncated file reused forever. Write temp +
-  `rename` (`internal/store/store.go`).
-- [x] **GC/install race** — GC scanning `apps/*/libs` can unlink a store file
-  written but not yet linked by a concurrent install; reference-count or
-  defer GC windows (`internal/store/store.go`).
-- [x] **Transactionality** — failure after lib extraction but before manifest
-  write leaves a half-install; stage in temp dir and rename app dir into
-  place; clean up on error (`internal/install/install.go`).
-- [x] **Refuse silent overwrite** — installing an existing app name must
-  require `--force` (`internal/install/install.go`).
-- [x] **Preserve existing RPATH** — `--set-rpath` overwrites legitimate
-  paths; append/preserve original entries (`internal/install/install.go`).
-- [x] **Wrapper fallback when patchelf fails** — packed/UPX/compressed
-  binaries: generate a shell wrapper with `LD_LIBRARY_PATH` instead of
-  aborting (`internal/install/install.go`).
-- [x] **Handle setuid and moved binaries** — glibc ignores RPATH for setuid;
-  copying a patched binary elsewhere breaks `$ORIGIN`. Detect and warn (or
-  document) (`internal/install/install.go`).
-- [x] **Friendly errors for non-ELF inputs** — scripts (shebang), musl,
-  non-ELF: detect and either wrap (script passthrough) or explain, instead
-  of a raw parser error (`internal/install/install.go`).
+- [x] **De-host the existing tests** — `internal/elf/version_test.go:10`
+  hardcodes `/usr/bin/curl` and `GLIBC_2.43`; fails on any other machine.
+  Ship fixtures (tiny checked-in ELFs) or `t.Skip`.
+- [x] **Table tests for the pure logic** — `provideToSoname`, `descField`,
+  `parseProvides`, `pkgURL`/`orderedServers`, `store.GC`/`ScanUsed`,
+  `manifest`, `validName`: all currently untested and I/O-free.
+- [x] **End-to-end install test** — serve a synthetic gzip `.db` + fake package
+  from `httptest` and run the full flow (blocked on the injectable-config
+  refactor above).
+- [x] **Add LICENSE; CI removed per request** — `go vet ./...` + `go test ./...`
+  run locally (GitHub Actions workflow removed).
 
-## Refactor / decide early
+## Docs / naming
 
-- [x] **Factor the BFS+stage step** out of `InstallElf` before implementing
-  `install-pkg` — resolution logic will otherwise diverge into two paths
-  (`internal/install/install.go`).
-- [x] **Decouple store/app paths** — GC derives `apps/` via
-  `filepath.Dir(StoreDir)`; make both explicit from a single config root
-  (`internal/store/store.go`, `internal/install/install.go`).
-- [x] **Arch-parameterize** — `$arch`/`usr/lib` hardcoded to x86_64; thread
-  architecture through repo index and extraction.
-- [x] **Multi-arch ELF detection** — reject (or handle) i686/musl binaries
-  explicitly instead of resolving against x86_64.
+- [x] **Fix README drift** — the diagram says
+  `patchelf --force-rpath '$ORIGIN/libs'` (`README.md:26`) but the code sets an
+  absolute path (`internal/install/install.go:233`); add a Requirements
+  section listing `bsdtar` + `patchelf`; drop `install-pkg` from usage until it
+  exists.
+- [x] **Implement or hide `install-pkg`** — `internal/install/install.go:371`
+  returns "not yet implemented" while `cmd/pkg/main.go:59` advertises it.
+- [x] **Unify naming** — module `probe`, binary `pkg`, state `~/.pap`, rc
+  comment `pap`. Pick one name for module path, binary, and state dir.
+
+## Performance / UX
+
+- [x] **Parallelize downloads** — the BFS resolves and downloads sequentially
+  (`internal/install/install.go:120-203`); add a worker pool + progress
+  output. `Download` returns the whole package as `[]byte`
+  (`internal/repo/repo.go:497`) and `copyFile` reads whole files — stream to
+  disk instead (packages reach hundreds of MB).
+- [x] **Stop editing shell rc silently** — `ensurePath` appends to
+  `~/.zshrc`/`.bashrc`/`.profile` (`internal/install/install.go:707`) without
+  consent, and its `.local/bin` substring match false-positives. Make it opt-in
+  (flag or prompt).
+- [x] **Safer uninstall** — remove `~/.local/bin/<name>` only if we placed it
+  (record it in the manifest), and run GC afterwards.
+- [x] **Manifest source hash** — record the source ELF's sha256
+  (`internal/install/install.go:245`) so reinstall warns on drift.
+- [x] **Locked reinstall fallback** — when the repo dropped a locked version
+  (`install.go:153`) offer `upgrade` instead of failing outright.
+- [x] **UX extras** — preflight check for `patchelf`/`bsdtar` (friendly error
+  or `pkg doctor`), `--dry-run`, `--version`, `pkg info <name>`, sizes/versions
+  in `list`, and an injected `io.Writer` for output (replace scattered
+  `fmt.Printf`/stderr writes) to support `--quiet`.
 
 ## Fix order
 
-1. Hard-fail unresolved sonames
-2. Hash-only store keys + atomic renames
-3. SHA256 verify from `.db`
-4. `.db` TTL + mirror pinning
-5. Per-lib RPATH patch
-6. Read the lock on reinstall
+1. `--force` rollback / atomic `publish`
+2. Dynamic host-lib skip list (unblocks aarch64)
+3. `Index.Load` locking + fail-fast + injectable config
+4. Repo cache out of `/tmp` + cross-process flock
+5. Test fixtures + CI
+6. README/naming cleanup

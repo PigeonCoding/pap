@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"probe/internal/config"
+	"pap/internal/config"
 )
 
 // gcGrace keeps entries that are younger than this alive, so a GC racing a
@@ -27,7 +27,13 @@ func Path(data []byte) string {
 // Store writes content under its sha256 hex digest (content-addressed, shared
 // across apps). Writes are atomic: temp file + rename, so a crash can never
 // leave a truncated file under a hash that later installs would trust.
+// Mode is preserved from the source file (masked to 0777); the default
+// Store keeps 0755 for existing callers.
 func Store(data []byte) (string, error) {
+	return StoreWithMode(data, 0755)
+}
+
+func StoreWithMode(data []byte, mode os.FileMode) (string, error) {
 	if err := Init(); err != nil {
 		return "", err
 	}
@@ -48,7 +54,14 @@ func Store(data []byte) (string, error) {
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
-	if err := os.Chmod(tmp.Name(), 0755); err != nil {
+	m := mode.Perm()
+	if m == 0 {
+		m = 0755
+	}
+	// Libraries need at most 0755; preserve exec bit, otherwise 0644.
+	// Exact source modes are kept (masked), so setuid bits never propagate
+	// (os.Chmod drops them unless explicitly set, and we mask to 0777).
+	if err := os.Chmod(tmp.Name(), m&0777); err != nil {
 		return "", err
 	}
 	if err := os.Rename(tmp.Name(), p); err != nil {

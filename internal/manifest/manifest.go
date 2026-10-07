@@ -7,12 +7,26 @@ import (
 )
 
 type Manifest struct {
-	Name     string            `json:"name"`
-	Binary   string            `json:"binary"`
-	Libs     []string          `json:"libs"`
-	Packages map[string]string `json:"packages"`
-	Package  string            `json:"package,omitempty"`
-	Source   string            `json:"source,omitempty"`
+	Name         string            `json:"name"`
+	Binary       string            `json:"binary"`
+	Libs         []string          `json:"libs"`
+	Packages     map[string]string `json:"packages"`
+	Package      string            `json:"package,omitempty"`
+	Source       string            `json:"source,omitempty"`
+	SourceSHA256 string            `json:"sourceSha256,omitempty"`
+	PlacedBinary bool              `json:"placedBinary,omitempty"`
+	// Launcher is set when the installed ~/.local/bin/<name> is a launcher
+	// script exec'ing the real binary at apps/<name>/bin/<name>. Used for
+	// binaries that locate resources relative to their own path
+	// (e.g. kitty's ../lib/kitty); the real binary must live inside the
+	// app dir for those lookups to resolve.
+	// Deprecated: new installs use ExeRel + a ~/.local/bin symlink instead.
+	Launcher bool `json:"launcher,omitempty"`
+	// ExeRel is the real binary's path relative to ~/.pap/exe/<name>.
+	// ~/.local/bin/<name> is a symlink to it, so /proc/self/exe resolves
+	// inside the exe payload and both absolute-RPATH lib lookup and
+	// exe-relative resource lookup keep working.
+	ExeRel string `json:"exeRel,omitempty"`
 }
 
 func Path(appDir string) string {

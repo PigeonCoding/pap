@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"probe/internal/elf"
-	"probe/internal/resolver"
+	"pap/internal/elf"
+	"pap/internal/resolver"
 )
 
 type compatChecker struct {
@@ -48,7 +48,7 @@ func (c *compatChecker) check(path string) {
 	base := filepath.Base(path)
 
 	for _, n := range info.NEEDED {
-		if resolver.SkipLibs[n] {
+		if resolver.Skip(n) {
 			continue
 		}
 		prov := c.provider(n)

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"probe/internal/repo"
+	"pap/internal/repo"
 )
 
 func makePkgFile(t *testing.T, pkginfo string) string {

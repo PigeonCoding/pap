@@ -91,6 +91,18 @@ func IsScript(path string) bool {
 	return hdr[0] == '#' && hdr[1] == '!'
 }
 
+// IsStatic reports whether path is a statically linked ELF (no .dynamic
+// section): it loads no shared libraries, so there is nothing to isolate
+// and patchelf cannot rewrite it.
+func IsStatic(path string) bool {
+	f, err := elf.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	return f.Section(".dynamic") == nil
+}
+
 // HostMachineError returns a descriptive error when the ELF targets a
 // different architecture than the host we are installing for.
 func MachineMismatch(machine elf.Machine, hostArch string) error {
