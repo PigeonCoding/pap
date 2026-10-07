@@ -170,8 +170,13 @@ func TestEnsureMirrorlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mirrorlist not created: %v", err)
 	}
-	if !strings.Contains(string(data), "Server = ") {
-		t.Fatalf("seeded mirrorlist has no servers:\n%s", data)
+	if got := strings.Count(string(data), "Server = "); got != len(seedOfficialMirrors)+len(chaoticServers) {
+		t.Fatalf("seeded mirrorlist has %d servers, want %d:\n%s", got, len(seedOfficialMirrors)+len(chaoticServers), data)
+	}
+	for _, sec := range []string{"[official]", "[chaotic-aur]"} {
+		if !strings.Contains(string(data), sec) {
+			t.Fatalf("seeded mirrorlist lacks %s:\n%s", sec, data)
+		}
 	}
 
 	// An existing file (user edits) is never overwritten.
@@ -182,6 +187,59 @@ func TestEnsureMirrorlist(t *testing.T) {
 	EnsureMirrorlist()
 	if data, err := os.ReadFile(file); err != nil || string(data) != custom {
 		t.Fatalf("existing mirrorlist touched: %q,%v", data, err)
+	}
+}
+
+func TestPapMirrorlistSections(t *testing.T) {
+	orig := config.Mirrorlist
+	t.Cleanup(func() { config.Mirrorlist = orig })
+
+	// Sectioned file: official and chaotic split.
+	file := filepath.Join(t.TempDir(), "mirrorlist")
+	body := "# comment\n[official]\nServer = https://off.example/$repo/os/$arch\n" +
+		"[chaotic-aur]\nServer = https://chaotic.example/$repo/$arch\n"
+	if err := os.WriteFile(file, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	config.Mirrorlist = file
+	official, chaotic := papMirrorlist()
+	if !slices.Equal(official, []string{"https://off.example/$repo/os/$arch"}) {
+		t.Errorf("official = %v", official)
+	}
+	if !slices.Equal(chaotic, []string{"https://chaotic.example/$repo/$arch"}) {
+		t.Errorf("chaotic = %v", chaotic)
+	}
+
+	// Legacy flat file: everything counts as official, chaotic untouched.
+	flat := filepath.Join(t.TempDir(), "flat")
+	if err := os.WriteFile(flat, []byte("Server = https://flat.example/$repo/os/$arch\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	config.Mirrorlist = flat
+	official, chaotic = papMirrorlist()
+	if !slices.Equal(official, []string{"https://flat.example/$repo/os/$arch"}) {
+		t.Errorf("flat official = %v", official)
+	}
+	if len(chaotic) != 0 {
+		t.Errorf("flat chaotic = %v, want empty", chaotic)
+	}
+
+	// loadRepos honors the chaotic section without leaking it elsewhere.
+	config.Mirrorlist = file
+	byName := map[string][]string{}
+	for _, d := range loadRepos() {
+		byName[d.name] = d.servers
+	}
+	if !slices.Equal(byName["chaotic-aur"], []string{"https://chaotic.example/$repo/$arch"}) {
+		t.Errorf("chaotic-aur servers = %v", byName["chaotic-aur"])
+	}
+	for _, name := range []string{"core", "extra", "multilib"} {
+		if !slices.Equal(byName[name], []string{"https://off.example/$repo/os/$arch"}) {
+			t.Errorf("%s servers = %v", name, byName[name])
+		}
+		if slices.Contains(byName[name], "https://chaotic.example/$repo/$arch") {
+			t.Errorf("%s servers leak chaotic mirror: %v", name, byName[name])
+		}
 	}
 }
 

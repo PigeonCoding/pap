@@ -129,16 +129,17 @@ func optionalRepo(name string) bool {
 	return name == "multilib" || name == "chaotic-aur"
 }
 
-// loadRepos builds the fixed repo set. Server lists come from a pkg-only
-// mirrorlist (~/.pap/mirrorlist) when present, so the official Arch repos can
-// be pinned without touching the system; otherwise from pacman.conf sections
-// (so the user's mirror preference is respected), then
-// /etc/pacman.d/mirrorlist. chaotic-aur is never served by the Arch mirrors
-// and keeps its own servers.
+// loadRepos builds the fixed repo set. Server lists come from the pap-only
+// mirrorlist (~/.pap/mirrorlist) when present, so the official Arch repos
+// can be pinned without touching the system; otherwise from pacman.conf
+// sections (so the user's mirror preference is respected), then
+// /etc/pacman.d/mirrorlist. chaotic-aur uses the file's [chaotic-aur]
+// section when present, else its own servers — it is never served by the
+// Arch mirrors.
 func loadRepos() []repoDef {
 	conf := parsePacmanConf()
 	mirrors := loadMirrors()
-	custom := mirrorlistServers(config.Mirrorlist)
+	custom, customChaotic := papMirrorlist()
 
 	var defs []repoDef
 	for _, name := range wantedRepos {
@@ -150,6 +151,9 @@ func loadRepos() []repoDef {
 			servers = conf[name]
 		case name == "chaotic-aur":
 			servers = chaoticServers
+			if len(customChaotic) > 0 {
+				servers = customChaotic
+			}
 		default:
 			servers = mirrors
 		}
@@ -158,43 +162,91 @@ func loadRepos() []repoDef {
 	return defs
 }
 
+// seedOfficialMirrors is the first-launch content of the [official] section.
+var seedOfficialMirrors = []string{
+	"https://fastly.mirror.pkgbuild.com/$repo/os/$arch",
+	"https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+	"https://ftpmirror.infania.net/mirror/archlinux/$repo/os/$arch",
+	"http://mirror.rackspace.com/archlinux/$repo/os/$arch",
+	"https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+}
+
+// papMirrorlist reads the pap-only mirrorlist, split by section. Files
+// without sections (the legacy layout) count entirely as official mirrors,
+// so existing files keep working unchanged.
+func papMirrorlist() (official, chaotic []string) {
+	paths, err := filepath.Glob(config.Mirrorlist)
+	if err != nil {
+		return nil, nil
+	}
+	section := ""
+	seen := map[string]bool{}
+	add := func(dst *[]string, s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[section+"\x00"+s] {
+			return
+		}
+		seen[section+"\x00"+s] = true
+		*dst = append(*dst, s)
+	}
+	var bare []string
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, raw := range strings.Split(string(data), "\n") {
+			line := strings.TrimSpace(raw)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+				section = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+				continue
+			}
+			if !strings.HasPrefix(line, "Server") {
+				continue
+			}
+			if _, val, ok := strings.Cut(line, "="); ok {
+				switch section {
+				case "chaotic-aur":
+					add(&chaotic, val)
+				case "official":
+					add(&official, val)
+				default:
+					add(&bare, val)
+				}
+			}
+		}
+	}
+	if len(official) == 0 {
+		official = bare
+	}
+	return official, chaotic
+}
+
+// defaultServer is the single mirror pap falls back to when the system
+// configures none. It keeps the $repo/os/$arch shape indexURL/pkgURL expect.
+const defaultServer = "https://mirror.krfoss.org/archlinux/$repo/os/$arch"
+
 // EnsureMirrorlist populates the pap-only mirrorlist (~/.pap/mirrorlist) on
-// first launch, seeded from the system's configured mirrors. The file is an
-// override for the official Arch repos (chaotic-aur keeps its own servers);
-// an existing file is never touched, so user edits are safe.
+// first launch with the default mirrors (official section plus chaotic-aur).
+// An existing file is never touched, so user edits are safe.
 func EnsureMirrorlist() {
 	path := config.Mirrorlist
 	if _, err := os.Stat(path); err == nil {
 		return
 	}
-	var servers []string
-	seen := map[string]bool{}
-	add := func(s string) {
-		s = strings.TrimSpace(s)
-		if s != "" && !seen[s] {
-			seen[s] = true
-			servers = append(servers, s)
-		}
-	}
-	conf := parsePacmanConf()
-	for _, name := range wantedRepos {
-		if name == "chaotic-aur" {
-			continue
-		}
-		for _, s := range conf[name] {
-			add(s)
-		}
-	}
-	if len(servers) == 0 {
-		for _, s := range loadMirrors() {
-			add(s)
-		}
-	}
 	var sb strings.Builder
 	sb.WriteString("# pap mirrors: override for the official Arch repos " +
-		"(core/extra/multilib).\n# Seeded from your system mirrors on first launch; " +
-		"edit or reorder the Server lines to pin pap.\n# chaotic-aur keeps its own servers and ignores this file.\n")
-	for _, s := range servers {
+		"(core/extra/multilib) plus chaotic-aur.\n# Seeded on first launch; " +
+		"edit or reorder the Server lines to pin pap.\n")
+	sb.WriteString("[official]\n")
+	for _, s := range seedOfficialMirrors {
+		sb.WriteString("Server = " + s + "\n")
+	}
+	sb.WriteString("[chaotic-aur]\n")
+	for _, s := range chaoticServers {
 		sb.WriteString("Server = " + s + "\n")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -279,7 +331,7 @@ func mirrorlistServers(pattern string) []string {
 func loadMirrors() []string {
 	data, err := os.ReadFile("/etc/pacman.d/mirrorlist")
 	if err != nil {
-		return []string{"https://mirror.krfoss.org/archlinux"}
+		return []string{defaultServer}
 	}
 	var mirrors []string
 	for _, line := range strings.Split(string(data), "\n") {
@@ -289,7 +341,7 @@ func loadMirrors() []string {
 		}
 	}
 	if len(mirrors) == 0 {
-		mirrors = append(mirrors, "https://mirror.krfoss.org/archlinux")
+		mirrors = append(mirrors, defaultServer)
 	}
 	return mirrors
 }
