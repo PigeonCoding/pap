@@ -2,7 +2,7 @@
 
 Per-app library isolation for ELF binaries.
 
-Give it an ELF, a script, or an app folder: it resolves every non-host
+Give it an ELF/app folder and it resolves every non-host
 library recursively, downloads the exact packages from Arch mirrors, vendors
 the `.so` files into a content-addressed store, and patches `RPATH` to a
 private `libs/` folder.
