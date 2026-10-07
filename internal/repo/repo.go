@@ -95,6 +95,11 @@ var testOverride *Index
 // OverrideDefault swaps the singleton (tests only); pass nil to restore.
 func OverrideDefault(idx *Index) { testOverride = idx }
 
+// IsTestOverride reports whether Default is currently swapped for an httptest
+// index. Install's archive fallback skips real-network ALA lookups in that
+// mode unless explicitly dated.
+func IsTestOverride() bool { return testOverride != nil }
+
 // New builds an index backed by cacheDir (repo .db/.files) and pkgCacheDir
 // (downloaded packages). Repos are resolved from pacman.conf/mirrorlist.
 func New(cacheDir, pkgCacheDir string) *Index {

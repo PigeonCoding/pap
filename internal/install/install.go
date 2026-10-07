@@ -27,13 +27,20 @@ var Version = "0.2"
 
 // InstallOptions controls install behavior.
 type InstallOptions struct {
-	Force   bool              // overwrite an existing app of the same name
-	Locked  map[string]string // exact "repo/name" -> version lock (reinstall)
-	DryRun  bool              // resolve and print plan without modifying apps/bin
-	Quiet   bool              // suppress progress output
-	AddPath bool              // allow appending ~/.local/bin to shell rc
-	Exe     string            // folder installs: explicit main executable, relative to the folder root
-	Out     io.Writer         // progress output (nil = stdout)
+	Force       bool              // overwrite an existing app of the same name
+	Locked      map[string]string // exact "repo/name" -> version lock (reinstall)
+	DryRun      bool              // resolve and print plan without modifying apps/bin
+	Quiet       bool              // suppress progress output
+	AddPath     bool              // allow appending ~/.local/bin to shell rc
+	Exe         string            // payload installs: explicit main executable, relative to the payload root
+	Out         io.Writer         // progress output (nil = stdout)
+	ArchiveDate string            // YYYY-MM-DD snapshot for ALA fallback ("" = auto from ELF mtime)
+	NoArchive   bool              // disable the archive.org fallback entirely
+	// ManifestSource/ManifestPackage override the manifest's source record.
+	// Set by InstallRepoApp so reinstall/upgrade can re-fetch the same
+	// package instead of pointing at a local path.
+	ManifestSource  string
+	ManifestPackage string
 }
 
 func (o InstallOptions) out() io.Writer {
@@ -78,93 +85,6 @@ func Doctor() error {
 	fmt.Println("doctor: bsdtar + patchelf found, state dirs writable")
 	fmt.Printf("  arch: %s  base: %s  bin: %s\n", config.Arch, config.BaseDir, config.BinDir)
 	return nil
-}
-
-func InstallElf(path, name string, opts InstallOptions) error {
-	if err := Preflight(); err != nil {
-		return err
-	}
-	// Cross-process lock covers stage pruning, publish swaps and package
-	// cache writes for the whole install.
-	lh, err := lock.Acquire(config.LockFile)
-	if err != nil {
-		return fmt.Errorf("acquire lock: %w", err)
-	}
-	defer lh.Release()
-
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	if name == "" {
-		name = defaultName(abs)
-	}
-	if err := validName(name); err != nil {
-		return err
-	}
-	st, err := os.Stat(abs)
-	if err != nil {
-		return err
-	}
-
-	if err := prepareInstall(name, opts.Force); err != nil {
-		return err
-	}
-
-	if st.IsDir() {
-		return installDir(abs, name, opts)
-	}
-	srcHash := fileSHA256Hex(abs)
-	if elf.IsScript(abs) {
-		return installScript(abs, name, opts, srcHash)
-	}
-	if !elf.IsELF(abs) {
-		return fmt.Errorf("%s: not an ELF binary or shebang script", abs)
-	}
-	return installFile(abs, name, opts, srcHash)
-}
-
-// SplitInstallArgs resolves `install <path> [name]` positionals, tolerating
-// swapped `install <name> <path>` order: when the straight reading is
-// invalid (bad name or missing path) but swapping yields an existing path
-// plus a valid name, the swap wins. More than 2 positionals is an error.
-func SplitInstallArgs(pos []string) (pathArg, name string, swapped bool, err error) {
-	if len(pos) == 0 {
-		return "", "", false, fmt.Errorf("missing <path>")
-	}
-	if len(pos) > 2 {
-		return "", "", false, fmt.Errorf("too many arguments (%s); usage: install <path> [name]", strings.Join(pos, " "))
-	}
-	pathArg = pos[0]
-	if len(pos) > 1 {
-		name = pos[1]
-	}
-	straightOK := exists(pathArg) && (name == "" || validName(name) == nil)
-	if straightOK {
-		return pathArg, name, false, nil
-	}
-	if name != "" && exists(name) && validName(pathArg) == nil {
-		return name, pathArg, true, nil
-	}
-	if !exists(pathArg) {
-		return "", "", false, fmt.Errorf("%s: no such file or directory", pathArg)
-	}
-	return "", "", false, fmt.Errorf("invalid app name %q", name)
-}
-
-func exists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
-
-// defaultName derives the app name: directory base for folders, file base
-// minus extension for files.
-func defaultName(abs string) string {
-	base := filepath.Base(abs)
-	if st, err := os.Stat(abs); err == nil && st.IsDir() {
-		return base
-	}
-	return strings.TrimSuffix(base, filepath.Ext(base))
 }
 
 // prepareInstall checks for existing installs and readies state dirs.
@@ -257,154 +177,30 @@ func patchPrivateLibs(privateLibs []string, libsDir string) error {
 	return nil
 }
 
-func installFile(absExe, name string, opts InstallOptions, srcHash string) error {
-	info, err := elf.Parse(absExe)
-	if err != nil {
-		return err
-	}
-	if err := checkELFHost(absExe, info); err != nil {
-		return err
-	}
-
-	// Electron/Chromium-style bundles (codium, VS Code, ...) locate
-	// icudtl.dat, *.pak and locales/ next to the binary — none of which a
-	// single-file install vendors. Installing just the inner ELF leaves an
-	// app that crashes on startup (e.g. "Invalid file descriptor to ICU
-	// data received"). Point at the folder so the whole bundle ships.
-	if bundle, ok := electronBundleDir(absExe); ok {
-		return fmt.Errorf("%s looks like part of an app bundle (%s ships %s next to it); install the folder instead: pap install %s <name>",
-			absExe, bundle, "icudtl.dat + resources.pak", bundle)
-	}
-
-	opts.printf("Installing %s from %s\n", name, absExe)
-	opts.printf("Direct NEEDED: %v\n", info.NEEDED)
-
-	if err := repo.Default().Load(); err != nil {
-		return fmt.Errorf("load repo index: %w", err)
-	}
-
-	var toResolve []string
-	for _, lib := range info.NEEDED {
-		if !resolver.Skip(lib) {
-			toResolve = append(toResolve, lib)
-		}
-	}
-
-	// Binaries that locate resources relative to their own path (kitty's
-	// ../lib/kitty, similar ../share/ layouts) break when relocated on their
-	// own: the sibling resource tree is vendored next to the installed copy
-	// under ~/.pap/exe/<name>, where ../lib/<app> keeps resolving.
-	resDirs, corpus := appendSiblingResources(detectResourceDirs(absExe, name), absExe)
-	var resHosts []string
-	for _, rd := range resDirs {
-		opts.printf("App resources: %s -> %s\n", rd.host, filepath.Join("exe", name, rd.rel()))
-		resHosts = append(resHosts, rd.host)
-		toResolve = append(toResolve, neededFromTree(rd.host)...)
-	}
-	// Companion executables next to the main binary (kitty's `kitten`):
-	// referenced at runtime, shipped in the same dir.
-	binSibs := detectBinSiblings(absExe, corpus)
-	for _, sib := range binSibs {
-		opts.printf("Companion binary: %s\n", sib)
-		toResolve = append(toResolve, neededFromFile(sib)...)
-	}
-	// Libraries shipped next to the binary (bundle lib dirs, $ORIGIN rpaths)
-	// win over repo downloads: the bundle is self-consistent.
-	localRoots := append([]string{filepath.Dir(absExe)}, resHosts...)
-	local := buildLocalLibs(append(localRoots, originLibDirs(absExe)...))
-
-	if opts.DryRun {
-		opts.printf("Dry run: would copy %s to exe/%s/bin/\n", absExe, name)
-		if len(resDirs) > 0 {
-			opts.printf("Dry run: would vendor %d resource dir(s)\n", len(resDirs))
-		}
-		return dryRun(toResolve, local, opts)
-	}
-
-	stg, err := stagePair()
-	if err != nil {
-		return err
-	}
-	defer stg.cleanup()
-	stageApp, stageExe := stg.app, stg.exe
-
-	libsDir := filepath.Join(stageApp, "libs")
-	if err := os.MkdirAll(libsDir, 0755); err != nil {
-		return err
-	}
-
-	installedLibs, _, usedPkgs, err := resolveStageCompat([]string{absExe}, toResolve, libsDir, local, opts)
-	if err != nil {
-		return err
-	}
-
-	opts.printf("\nInstalling binary...\n")
-	stagedBin := filepath.Join(stageExe, "bin", name)
-	if err := os.MkdirAll(filepath.Dir(stagedBin), 0755); err != nil {
-		return err
-	}
-	if err := copyFile(stagedBin, absExe); err != nil {
-		return err
-	}
-
-	// RPATH is absolute to the app's libs dir, so it resolves identically
-	// through the ~/.local/bin symlink.
-	libsAbs := filepath.Join(config.AppsDir, name, "libs")
-	opts.printf("Patching RPATH...\n")
-	if err := patchBinaryRPATH(stagedBin, libsAbs); err != nil {
-		return err
-	}
-
-	// Companion binaries ship next to the main one with the same layout.
-	for _, sib := range binSibs {
-		dst := filepath.Join(stageExe, "bin", filepath.Base(sib))
-		opts.printf("Vendoring companion %s...\n", filepath.Base(sib))
-		if err := copyFile(dst, sib); err != nil {
-			return fmt.Errorf("vendor companion %s: %w", sib, err)
-		}
-		if err := patchBinaryRPATH(dst, libsAbs); err != nil {
-			return fmt.Errorf("patchelf companion %s: %w", sib, err)
-		}
-	}
-
-	exeRel := filepath.Join("bin", name)
-	for _, rd := range resDirs {
-		dest, ok := stageResourceDest(exeRel, rd)
-		if !ok {
-			opts.printf("  skip resources %s: escapes the exe payload\n", rd.host)
-			continue
-		}
-		opts.printf("Vendoring resources %s...\n", rd.host)
-		if err := copyTree(rd.host, filepath.Join(stageExe, dest)); err != nil {
-			return fmt.Errorf("vendor resources %s: %w", rd.host, err)
-		}
-	}
-
-	installedLibs = dedup(installedLibs)
-	m := &manifest.Manifest{
-		Name:         name,
-		Binary:       name,
-		Libs:         installedLibs,
-		Packages:     usedPkgs,
-		Source:       absExe,
-		SourceSHA256: srcHash,
-		PlacedBinary: true,
-		ExeRel:       exeRel,
-	}
-	if err := manifest.Save(stageApp, m); err != nil {
-		return err
-	}
-
-	return finishInstall(stg, name, m.ExeRel, opts)
-}
-
-// installDir installs a whole folder: the tree is copied verbatim to
+// installDir installs a materialized payload tree (a folder install, or a
+// repo package extracted to a temp dir): the tree is copied verbatim to
 // ~/.pap/exe/<name>/pkg/ (layout preserved, so sibling resources and plain
 // `lib/` lookups keep working), every ELF in the tree is patched in place
 // so its .so deps resolve to apps/<name>/libs, and ~/.local/bin/<name>
 // symlinks to the main entrypoint (which may itself be a shebang script —
 // the surrounding ELFs are still patched, so the script stays local).
+// It takes the cross-process lock and prepares state dirs itself.
 func installDir(absDir, name string, opts InstallOptions) error {
+	if err := Preflight(); err != nil {
+		return err
+	}
+	lh, err := lock.Acquire(config.LockFile)
+	if err != nil {
+		return fmt.Errorf("acquire lock: %w", err)
+	}
+	defer lh.Release()
+
+	if err := validName(name); err != nil {
+		return err
+	}
+	if err := prepareInstall(name, opts.Force); err != nil {
+		return err
+	}
 	var mainRel string
 	if opts.Exe != "" {
 		var err error
@@ -518,7 +314,7 @@ func installDir(absDir, name string, opts InstallOptions) error {
 		if len(staged) > 0 {
 			opts.printf("Dry run: would vendor %d resource dir(s)\n", len(staged))
 		}
-		return dryRun(toResolve, local, opts)
+		return dryRun([]string{absMain}, toResolve, local, opts)
 	}
 
 	stg, err := stagePair()
@@ -597,12 +393,17 @@ func installDir(absDir, name string, opts InstallOptions) error {
 	}
 
 	installedLibs = dedup(installedLibs)
+	src := absDir
+	if opts.ManifestSource != "" {
+		src = opts.ManifestSource
+	}
 	m := &manifest.Manifest{
 		Name:         name,
 		Binary:       name,
 		Libs:         installedLibs,
 		Packages:     usedPkgs,
-		Source:       absDir,
+		Package:      opts.ManifestPackage,
+		Source:       src,
 		SourceSHA256: srcHash,
 		PlacedBinary: true,
 		ExeRel:       exeRel,
@@ -692,27 +493,27 @@ func resolveMainExe(absDir, name string) (string, error) {
 	}
 }
 
-// resolveExplicitExe validates an --exe override: a path relative to the
-// folder root pointing at an ELF binary or shebang script. It must stay
-// inside the folder (no absolute paths, no ".." escapes).
+// resolveExplicitExe validates a pinned entrypoint: a path relative to the
+// payload root pointing at an ELF binary or shebang script. It must stay
+// inside the payload (no absolute paths, no ".." escapes).
 func resolveExplicitExe(absDir, rel string) (string, error) {
 	if filepath.IsAbs(rel) {
-		return "", fmt.Errorf("--exe must be relative to the folder, got %q", rel)
+		return "", fmt.Errorf("entrypoint must be relative to the payload, got %q", rel)
 	}
 	clean := filepath.Clean(rel)
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("--exe %q escapes the folder", rel)
+		return "", fmt.Errorf("entrypoint %q escapes the payload", rel)
 	}
 	p := filepath.Join(absDir, clean)
 	st, err := os.Stat(p)
 	if err != nil {
-		return "", fmt.Errorf("--exe %q: %w", rel, err)
+		return "", fmt.Errorf("entrypoint %q: %w", rel, err)
 	}
 	if st.IsDir() {
-		return "", fmt.Errorf("--exe %q is a directory", rel)
+		return "", fmt.Errorf("entrypoint %q is a directory", rel)
 	}
 	if !elf.IsELF(p) && !elf.IsScript(p) {
-		return "", fmt.Errorf("--exe %q is not an executable (ELF or shebang script)", rel)
+		return "", fmt.Errorf("entrypoint %q is not an executable (ELF or shebang script)", rel)
 	}
 	return clean, nil
 }
@@ -882,13 +683,87 @@ func finishInstall(stg *stager, name, exeRel string, opts InstallOptions) error 
 	return nil
 }
 
+// archiveScope carries the dated ALA fallback state for one install run: the
+// target snapshot date plus the lazily loaded archive index. ELF files record
+// no package versions, so the snapshot date (from --archive-date or the app
+// binary's mtime) is the version proxy: sonames missing from the live repos
+// resolve against the repo .db as of that date instead of latest.
+type archiveScope struct {
+	enabled bool
+	date    time.Time
+	idx     *repo.Index
+	used    string // snapshot actually loaded (YYYY-MM-DD, after backtrack)
+	// warned records sonames already reported as archive-resolved, to keep
+	// output readable when many transitive deps fall back together.
+	warned map[string]bool
+	// explicit is set when --archive-date was passed: tests override Default
+	// with httptest indexes, and auto-mode archive lookups would hit the
+	// real network — skip those, but honor explicit dates (tests for the
+	// archive path itself set one).
+	explicit bool
+}
+
+func newArchiveScope(roots []string, opts InstallOptions) *archiveScope {
+	s := &archiveScope{warned: map[string]bool{}}
+	if opts.NoArchive {
+		return s
+	}
+	if opts.ArchiveDate != "" {
+		d, err := repo.ParseArchiveDate(opts.ArchiveDate)
+		if err != nil {
+			opts.printf("warning: %v; archive fallback disabled\n", err)
+			return s
+		}
+		s.enabled, s.date = true, d
+		s.explicit = true
+		return s
+	}
+	// Auto mode: snapshot date = main root ELF's mtime (build-date proxy).
+	// Disabled when roots carry no usable mtime would just mean "now",
+	// which duplicates the live index — still useful as a fallback source
+	// for sonames the live mirrors already pruned.
+	s.enabled, s.date = true, repo.ArchiveDateFromRoots(roots)
+	return s
+}
+
+// providersFor returns the live providers when non-empty, else the archived
+// snapshot's providers (loading the snapshot once). The returned index is the
+// one to download from so package bytes match the resolving snapshot.
+func (s *archiveScope) providersFor(soname string) ([]repo.PkgInfo, *repo.Index, string) {
+	live := repo.Default().Providers(soname)
+	if len(live) > 0 || !s.enabled {
+		return live, nil, ""
+	}
+	// When tests override Default with an httptest index, ArchiveIndex would
+	// hit the real network — skip it unless an explicit --archive-date opts
+	// in (unit tests below cover archive.go directly against httptest).
+	if repo.IsTestOverride() && !s.explicit && s.used == "" && s.idx == nil {
+		return live, nil, ""
+	}
+	if s.idx == nil && s.used == "" {
+		idx, used, err := repo.ArchiveIndex(s.date)
+		if err != nil {
+			return live, nil, ""
+		}
+		s.idx, s.used = idx, used
+	}
+	if s.idx == nil {
+		return live, nil, ""
+	}
+	arch := s.idx.Providers(soname)
+	if len(arch) == 0 {
+		return live, nil, ""
+	}
+	return arch, s.idx, s.used
+}
+
 // resolveAndStage BFS-resolves sonames, downloading packages in parallel
 // per frontier and extracting sequentially for determinism. Sonames present
 // in local (libraries shipped next to the source) are staged from disk and
 // never downloaded: the bundle is self-consistent. localStaged reports which
 // sonames came from the bundle, so callers can re-stage them from the repo
 // when the bundled copy turns out to be incompatible.
-func resolveAndStage(toResolve []string, libsDir string, local map[string]string, opts InstallOptions) (installed, private []string, usedPkgs map[string]string, localStaged map[string]bool, err error) {
+func resolveAndStage(roots []string, toResolve []string, libsDir string, local map[string]string, opts InstallOptions) (installed, private []string, usedPkgs map[string]string, localStaged map[string]bool, err error) {
 	var installedLibs []string
 	var privateLibs []string
 	usedPkgs = map[string]string{}
@@ -899,6 +774,12 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 	freshPins := 0
 	pkgCache := map[string][]byte{}
 	var pkgMu sync.Mutex
+	arch := newArchiveScope(roots, opts)
+	// Locked reinstalls pin manifest versions: never reach into the archive
+	// for a different version — refuse instead so the pin stays exact.
+	if opts.Locked != nil {
+		arch.enabled = false
+	}
 
 	if len(toResolve) > 0 {
 		opts.printf("\nResolving dependencies (recursive)...\n")
@@ -921,9 +802,11 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 		// so prefetch every frontier's first-choice package in parallel.
 		var tasks []dlTask
 		provLists := make([][]repo.PkgInfo, len(frontier))
+		provIdx := make([]*repo.Index, len(frontier))
+		provSnap := make([]string, len(frontier))
 		provFresh := make([]bool, len(frontier))
 		for i, soname := range frontier {
-			providers := repo.Default().Providers(soname)
+			providers, srcIdx, snap := arch.providersFor(soname)
 			// Version lock: when none of the providers are in the locked
 			// set, the soname is a dependency the manifest never pinned
 			// (e.g. newly discovered via resource-tree scan on reinstall)
@@ -947,6 +830,8 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 				provFresh[i] = true
 			}
 			provLists[i] = providers
+			provIdx[i] = srcIdx
+			provSnap[i] = snap
 			if _, ok := local[soname]; ok {
 				continue // staged from disk below; nothing to prefetch
 			}
@@ -958,7 +843,7 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 			_, cached := pkgCache[key]
 			pkgMu.Unlock()
 			if !cached {
-				tasks = append(tasks, dlTask{soname: soname, pkg: providers[0], key: key})
+				tasks = append(tasks, dlTask{soname: soname, pkg: providers[0], key: key, idx: srcIdx})
 			}
 		}
 		parallelDownload(tasks, pkgCache, &pkgMu, opts)
@@ -984,11 +869,24 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 			}
 			if !staged {
 				providers := provLists[fi]
+				srcIdx := provIdx[fi]
+				snap := provSnap[fi]
+				downloadFrom := func(pkg repo.PkgInfo) ([]byte, error) {
+					if srcIdx != nil {
+						return srcIdx.Download(pkg)
+					}
+					return repo.Default().Download(pkg)
+				}
 				if len(providers) == 0 {
 					// Recompute unfiltered list for a precise error.
 					raw := repo.Default().Providers(soname)
 					if len(raw) == 0 {
 						msg := fmt.Sprintf("%s: no package provides %s", soname, soname)
+						if arch.enabled && arch.used == "" {
+							msg += " (live and archive have no provider)"
+						} else if arch.enabled && arch.used != "" {
+							msg += fmt.Sprintf(" (live and archive %s have no provider)", arch.used)
+						}
 						opts.printf("  [fail] %s\n", msg)
 						failures = append(failures, msg)
 					} else {
@@ -1021,7 +919,7 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 					pkgMu.Unlock()
 					if !ok {
 						var derr error
-						data, derr = repo.Default().Download(pkg)
+						data, derr = downloadFrom(pkg)
 						if derr != nil {
 							lastErr = fmt.Errorf("download %s: %w", pkg.Name, derr)
 							continue
@@ -1042,6 +940,8 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 					if provFresh[fi] {
 						freshPins++
 						opts.printf("  [ ok ] %s -> %s/%s %s (new pin)\n", soname, pkg.Repo, pkg.Name, pkg.Version)
+					} else if snap != "" {
+						opts.printf("  [archive %s] %s -> %s/%s %s\n", snap, soname, pkg.Repo, pkg.Name, pkg.Version)
 					} else {
 						opts.printf("  [ ok ] %s -> %s/%s %s\n", soname, pkg.Repo, pkg.Name, pkg.Version)
 					}
@@ -1088,6 +988,7 @@ type dlTask struct {
 	soname string
 	pkg    repo.PkgInfo
 	key    string
+	idx    *repo.Index // nil = live default; non-nil = archive snapshot
 }
 
 // resolveStageCompat resolves and stages like resolveAndStage, then verifies
@@ -1110,7 +1011,7 @@ func resolveStageCompat(roots []string, toResolve []string, libsDir string, loca
 				}
 			}
 		}
-		ins, priv, used, localStaged, rerr := resolveAndStage(toResolve, libsDir, active, opts)
+		ins, priv, used, localStaged, rerr := resolveAndStage(roots, toResolve, libsDir, active, opts)
 		if rerr != nil {
 			return nil, nil, nil, rerr
 		}
@@ -1136,7 +1037,9 @@ func resolveStageCompat(roots []string, toResolve []string, libsDir string, loca
 			if !localStaged[p.Needed] || forced[p.Needed] || seenHeal[p.Needed] {
 				continue
 			}
-			if len(repo.Default().Providers(p.Needed)) == 0 {
+			// Healable when the live index provides it, or when the archive
+			// fallback is enabled (resolveAndStage will try the snapshot).
+			if len(repo.Default().Providers(p.Needed)) == 0 && (opts.NoArchive || opts.Locked != nil) {
 				continue
 			}
 			seenHeal[p.Needed] = true
@@ -1188,7 +1091,12 @@ func parallelDownload(tasks []dlTask, cache map[string][]byte, mu *sync.Mutex, o
 			if ok {
 				return
 			}
-			data, err := repo.Default().Download(t.pkg)
+			data, err := func() ([]byte, error) {
+				if t.idx != nil {
+					return t.idx.Download(t.pkg)
+				}
+				return repo.Default().Download(t.pkg)
+			}()
 			if err != nil {
 				return // sequential pass reports the error
 			}
@@ -1202,19 +1110,27 @@ func parallelDownload(tasks []dlTask, cache map[string][]byte, mu *sync.Mutex, o
 	wg.Wait()
 }
 
-func dryRun(toResolve []string, local map[string]string, opts InstallOptions) error {
+func dryRun(roots []string, toResolve []string, local map[string]string, opts InstallOptions) error {
 	opts.printf("Dry run: would resolve %d top-level libs\n", len(toResolve))
+	arch := newArchiveScope(roots, opts)
+	if opts.Locked != nil {
+		arch.enabled = false
+	}
 	for _, soname := range toResolve {
 		if lp, ok := local[soname]; ok {
 			opts.printf("  [local] %s -> %s\n", soname, lp)
 			continue
 		}
-		providers := repo.Default().Providers(soname)
+		providers, _, snap := arch.providersFor(soname)
 		if len(providers) == 0 {
 			opts.printf("  [fail] %s: no package provides %s\n", soname, soname)
 			continue
 		}
 		p := providers[0]
+		if snap != "" {
+			opts.printf("  [archive %s] %s -> %s/%s %s\n", snap, soname, p.Repo, p.Name, p.Version)
+			continue
+		}
 		opts.printf("  [ ok ] %s -> %s/%s %s\n", soname, p.Repo, p.Name, p.Version)
 	}
 	opts.printf("Dry run: no changes made\n")
@@ -1243,30 +1159,20 @@ func ReinstallWithOptions(name string, opts InstallOptions) error {
 	if err != nil {
 		return fmt.Errorf("app %q not installed: %w", name, err)
 	}
-	if m.Source == "" {
-		return fmt.Errorf("%s: manifest has no source path (installed by an older version); use install instead", name)
-	}
-	if m.SourceSHA256 != "" {
-		cur := fileSHA256Hex(m.Source)
-		if cur != "" && cur != m.SourceSHA256 {
-			fmt.Printf("warning: source %s changed since install (reinstall pins repo versions, not source bytes)\n", m.Source)
-		}
+	pkg, ok := splitRepoSource(m.Source)
+	if !ok {
+		return fmt.Errorf("%s: manifest has no repo source (installed by an older version); use install instead", name)
 	}
 	opts.Force = true
 	if opts.Locked == nil {
 		opts.Locked = m.Packages
 	}
-	// Keep the previously chosen entrypoint (e.g. installed with --exe):
-	// folder manifests store it as pkg/<rel>, relative to the folder root.
-	// Without this, reinstall would silently re-resolve and possibly flip mains.
-	if opts.Exe == "" && m.ExeRel != "" {
-		if st, serr := os.Stat(m.Source); serr == nil && st.IsDir() {
-			if rel, ok := strings.CutPrefix(m.ExeRel, "pkg"+string(filepath.Separator)); ok && rel != "" {
-				opts.Exe = rel
-			}
-		}
+	// Re-fetch the pinned package version.
+	_, version, pok := splitPinnedPackage(m.Package)
+	if !pok {
+		return fmt.Errorf("%s: manifest has a repo source but no pinned package version; use install instead", name)
 	}
-	return InstallElf(m.Source, name, opts)
+	return InstallRepoApp(pkg, version, name, opts)
 }
 
 func Upgrade(name string) error {
@@ -1278,51 +1184,14 @@ func UpgradeWithOptions(name string, opts InstallOptions) error {
 	if err != nil {
 		return fmt.Errorf("app %q not installed: %w", name, err)
 	}
-	if m.Source == "" {
-		return fmt.Errorf("%s: manifest has no source path (installed by an older version); use install instead", name)
+	pkg, ok := splitRepoSource(m.Source)
+	if !ok {
+		return fmt.Errorf("%s: manifest has no repo source (installed by an older version); use install instead", name)
 	}
 	opts.Force = true
 	opts.Locked = nil
-	return InstallElf(m.Source, name, opts)
-}
-
-// installScript passes shebang scripts through verbatim: there are no ELF
-// dependencies to isolate. The script is stored under ~/.pap/exe/<name>
-// and symlinked from BinDir like every other app.
-func installScript(path, name string, opts InstallOptions, srcHash string) error {
-	opts.printf("Installing %s from %s (script, copied as-is)\n", name, path)
-	if opts.DryRun {
-		opts.printf("Dry run: would copy script to exe/%s/bin/ (no changes made)\n", name)
-		return nil
-	}
-	stg, err := stagePair()
-	if err != nil {
-		return err
-	}
-	defer stg.cleanup()
-
-	exeRel := filepath.Join("bin", name)
-	staged := filepath.Join(stg.exe, exeRel)
-	if err := os.MkdirAll(filepath.Dir(staged), 0755); err != nil {
-		return err
-	}
-	if err := copyFile(staged, path); err != nil {
-		return err
-	}
-	m := &manifest.Manifest{
-		Name:         name,
-		Binary:       name,
-		Packages:     map[string]string{},
-		Source:       path,
-		SourceSHA256: srcHash,
-		PlacedBinary: true,
-		ExeRel:       exeRel,
-	}
-	if err := manifest.Save(stg.app, m); err != nil {
-		return err
-	}
-
-	return finishInstall(stg, name, m.ExeRel, opts)
+	// Re-resolve to the live latest.
+	return InstallRepoApp(pkg, "", name, opts)
 }
 
 // pruneStaleStages removes staging dirs orphaned by killed installs.
@@ -1469,8 +1338,7 @@ func detectResourceDirs(exeAbs, name string) []resourceDir {
 // `%s/%s/kitty-extensions` (or inside frozen Python), so no single
 // `../lib/...` string exists to find in the ELF. System library dirs are
 // excluded: their hundreds of unrelated siblings belong to other packages.
-// It returns the extended dirs and the corpus (also used to find companion
-// executables living next to the main binary, e.g. kitty's `kitten`).
+// It returns the extended dirs and the reference corpus.
 func appendSiblingResources(direct []resourceDir, exeAbs string) ([]resourceDir, string) {
 	var hosts []string
 	for _, rd := range direct {
@@ -1572,46 +1440,6 @@ func isNameChar(b byte) bool {
 		b == '_' || b == '-' || b == '.' || b == '+'
 }
 
-// detectBinSiblings finds companion executables living next to the main
-// binary (kitty's `kitten`): same directory, ELF or script, executable bit,
-// name mentioned in corpus. Shared libraries are excluded (local-libs path
-// stages those through the store).
-func detectBinSiblings(absExe, corpus string) []string {
-	exeDir := filepath.Dir(absExe)
-	var exeStat os.FileInfo
-	if st, err := os.Stat(absExe); err == nil {
-		exeStat = st
-	}
-	entries, err := os.ReadDir(exeDir)
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, e := range entries {
-		if e.IsDir() || strings.Contains(e.Name(), ".so") || len(e.Name()) < 3 {
-			continue
-		}
-		p := filepath.Join(exeDir, e.Name())
-		if exeStat != nil {
-			if st, err := os.Stat(p); err != nil || os.SameFile(st, exeStat) {
-				continue
-			}
-		}
-		fi, err := e.Info()
-		if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm()&0111 == 0 {
-			continue
-		}
-		if !elf.IsELF(p) && !elf.IsScript(p) {
-			continue
-		}
-		if !mentionsName(corpus, e.Name()) {
-			continue
-		}
-		out = append(out, p)
-	}
-	return out
-}
-
 // neededFromFile collects a single ELF's DT_NEEDED (non-host) entries.
 func neededFromFile(path string) []string {
 	info, err := elf.Parse(path)
@@ -1684,22 +1512,6 @@ func exeRelativeRefs(path string) []string {
 func isRefByte(b byte) bool {
 	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' ||
 		b == '_' || b == '-' || b == '.' || b == '/' || b == '+'
-}
-
-// electronBundleDir reports whether absExe sits inside an
-// Electron/Chromium-style bundle directory: icudtl.dat plus resources.pak
-// next to the binary. Those data files are loaded exe-relative at runtime
-// and are only shipped by folder installs (the whole tree is copied
-// verbatim), so a single-file install of such a binary cannot work.
-func electronBundleDir(absExe string) (string, bool) {
-	dir := filepath.Dir(absExe)
-	for _, f := range []string{"icudtl.dat", "resources.pak"} {
-		st, err := os.Stat(filepath.Join(dir, f))
-		if err != nil || st.IsDir() {
-			return "", false
-		}
-	}
-	return dir, true
 }
 
 // listFolderELFs returns every ELF file under root, recursively. Symlinks

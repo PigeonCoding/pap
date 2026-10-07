@@ -136,37 +136,6 @@ func TestMentionsName(t *testing.T) {
 	}
 }
 
-func TestDetectBinSiblings(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "bin")
-	os.MkdirAll(bin, 0755)
-	hostELF := hostELFPath(t)
-	copyFile := func(dst string) {
-		t.Helper()
-		data, err := os.ReadFile(hostELF)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(dst, data, 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	main := filepath.Join(bin, "mainapp")
-	copyFile(main)
-	// Sibling companion: mentioned in corpus, executable ELF, no .so.
-	companion := filepath.Join(bin, "kitten")
-	copyFile(companion)
-	// Unmentioned sibling: must be skipped.
-	copyFile(filepath.Join(bin, "othertool"))
-	// .so files are never companions (local-libs path handles those).
-	os.WriteFile(filepath.Join(bin, "libx.so.1"), []byte("\x7fELF"), 0755)
-	corpus := "run kitten\x00 now"
-	got := detectBinSiblings(main, corpus)
-	if len(got) != 1 || got[0] != companion {
-		t.Fatalf("bin siblings = %v, want [%s]", got, companion)
-	}
-}
-
 func TestSiblingScanAllowed(t *testing.T) {
 	for _, sys := range []string{"/usr/lib", "/usr/lib64", "/lib", "/lib64", "/usr/share", "/usr/local/lib"} {
 		if siblingScanAllowed(sys) {
@@ -200,46 +169,13 @@ func TestCopyTreePreservesSymlinks(t *testing.T) {
 	}
 }
 
-func TestInstallScriptE2E(t *testing.T) {
+func TestUninstallWithoutManifestLeavesBin(t *testing.T) {
 	home := isolate(t)
-	src := filepath.Join(t.TempDir(), "hello.sh")
-	if err := os.WriteFile(src, []byte("#!/bin/sh\necho hi\n"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := InstallElf(src, "hello", InstallOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	bin := filepath.Join(home, "bin", "hello")
-	data, err := os.ReadFile(bin)
-	if err != nil {
-		t.Fatalf("installed bin missing: %v", err)
-	}
-	if len(data) == 0 || data[0] != '#' {
-		t.Fatalf("installed script mangled: %q", data[:min(20, len(data))])
-	}
-	// Script entrypoints install a launcher (regular file) so $0 resolves
-	// to the payload; accept a symlink too for backwards compatibility.
-	if fi, err := os.Lstat(bin); err != nil {
-		t.Fatalf("bin entry missing: %v", err)
-	} else if fi.Mode()&os.ModeSymlink == 0 && fi.Mode().Perm()&0111 == 0 {
-		t.Fatalf("bin entry is not executable: %v", fi.Mode())
-	}
-	m, err := manifest.Load(filepath.Join(home, "apps", "hello"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m.SourceSHA256 == "" || !m.PlacedBinary {
-		t.Fatalf("manifest missing hash/placed: %+v", m)
-	}
-	// Safer uninstall removes the binary we placed and runs GC.
-	if err := Uninstall("hello"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(bin); !os.IsNotExist(err) {
-		t.Fatal("bin not removed on uninstall")
-	}
 	// Uninstall without manifest must NOT touch bin.
 	if err := os.MkdirAll(filepath.Join(home, "apps", "ghost"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "bin"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	sentinel := filepath.Join(home, "bin", "ghost")
@@ -254,213 +190,30 @@ func TestInstallScriptE2E(t *testing.T) {
 	}
 }
 
-func TestDryRunMakesNoChanges(t *testing.T) {
-	home := isolate(t)
-	src := filepath.Join(t.TempDir(), "x.sh")
-	os.WriteFile(src, []byte("#!/bin/sh\n"), 0755)
-	if err := InstallElf(src, "x", InstallOptions{DryRun: true}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(home, "apps", "x")); !os.IsNotExist(err) {
-		t.Fatal("dry-run created app dir")
-	}
-}
-
-// TestInstallElfE2E builds a tiny binary needing libe2e.so.1, serves a
-// synthetic repo db + package over httptest, and runs the full install.
-func TestInstallElfE2E(t *testing.T) {
+func TestRepoAppDryRunMakesNoChanges(t *testing.T) {
 	if _, err := exec.LookPath("gcc"); err != nil {
 		t.Skip("gcc unavailable")
 	}
 	if _, err := exec.LookPath("bsdtar"); err != nil {
 		t.Skip("bsdtar unavailable")
 	}
-	if _, err := exec.LookPath("patchelf"); err != nil {
-		t.Skip("patchelf unavailable")
-	}
 	home := isolate(t)
 	work := t.TempDir()
 
-	// Fake shared lib with SONAME libe2e.so.1.
-	libSrc := "int e2e_fn(void){return 42;}\n"
-	os.WriteFile(filepath.Join(work, "e2e.c"), []byte(libSrc), 0644)
-	lib := filepath.Join(work, "libe2e.so.1.0")
-	cmd := exec.Command("gcc", "-shared", "-fPIC", "-Wl,-soname,libe2e.so.1", "-o", lib, filepath.Join(work, "e2e.c"))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("gcc lib: %v %s", err, out)
-	}
-	appSrc := "extern int e2e_fn(void); int main(void){return e2e_fn();}\n"
-	os.WriteFile(filepath.Join(work, "app.c"), []byte(appSrc), 0644)
-	appBin := filepath.Join(work, "appbin")
-	cmd = exec.Command("gcc", "-o", appBin, filepath.Join(work, "app.c"), "-L"+work, "-l:libe2e.so.1.0", "-Wl,-rpath,"+work)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("gcc app: %v %s", err, out)
-	}
-
-	// Fake Arch package containing usr/lib/libe2e.so.1.
-	pkgStaging := filepath.Join(work, "pkgroot")
-	os.MkdirAll(filepath.Join(pkgStaging, "usr", "lib"), 0755)
-	libBytes, _ := os.ReadFile(lib)
-	os.WriteFile(filepath.Join(pkgStaging, "usr", "lib", "libe2e.so.1"), libBytes, 0755)
-	pkginfo := "pkgname = e2elib\npkgver = 1.0-1\narch = x86_64\n"
-	os.WriteFile(filepath.Join(pkgStaging, ".PKGINFO"), []byte(pkginfo), 0644)
-	pkgFile := filepath.Join(work, "e2elib-1.0-1-x86_64.pkg.tar")
-	if out, err := exec.Command("bsdtar", "-cf", pkgFile, "-C", pkgStaging, "usr/lib/libe2e.so.1", ".PKGINFO").CombinedOutput(); err != nil {
-		t.Fatalf("bsdtar pkg: %v %s", err, out)
-	}
-	pkgBytes, _ := os.ReadFile(pkgFile)
-	h := sha256.Sum256(pkgBytes)
-	sha := hex.EncodeToString(h[:])
-
-	desc := "%FILENAME%\ne2elib-1.0-1-x86_64.pkg.tar\n\n%NAME%\ne2elib\n\n%VERSION%\n1.0-1\n\n%ARCH%\nx86_64\n\n%SHA256SUM%\n" + sha + "\n\n%PROVIDES%\nlibe2e.so=1-64\n"
-	dbBytes := gzipTar([]tarEntry{{"e2elib-1.0-1/desc", desc}})
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/core.db", func(w http.ResponseWriter, r *http.Request) { w.Write(dbBytes) })
-	mux.HandleFunc("/e2elib-1.0-1-x86_64.pkg.tar", func(w http.ResponseWriter, r *http.Request) { w.Write(pkgBytes) })
+	mux, _, _ := buildRepoE2E(t, work, "e2eapp", "1.0-1", "1.0-1")
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-
-	cacheDir := filepath.Join(home, "cache", "repo")
-	pkgCache := filepath.Join(home, "pkgcache")
-	idx := repo.NewTestRepo("core", srv.URL, cacheDir, pkgCache)
-	repo.OverrideDefault(idx)
-
-	if err := InstallElf(appBin, "e2eapp", InstallOptions{}); err != nil {
-		t.Fatalf("InstallElf e2e: %v", err)
-	}
-	link := filepath.Join(home, "bin", "e2eapp")
-	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("bin entry is not a symlink: %v %v", fi, err)
-	}
-	if _, err := os.Stat(filepath.Join(home, "exe", "e2eapp", "bin", "e2eapp")); err != nil {
-		t.Fatalf("real binary missing: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(home, "apps", "e2eapp", "libs", "libe2e.so.1")); err != nil {
-		t.Fatalf("vendored lib missing: %v", err)
-	}
-	// Run through the symlink: exit code 42 comes from e2e_fn().
-	if err := exec.Command(link).Run(); err == nil {
-		t.Fatal("expected exit code 42, got 0")
-	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 42 {
-		t.Fatalf("symlink run = %v, want exit 42", err)
-	}
-}
-
-// TestInstallElfE2EWithResources mirrors the kitty failure: the binary
-// embeds a ../lib/<app> reference and ships a host resource tree. Install
-// must vendor the tree and leave a working symlink in the bin dir.
-func TestInstallElfE2EWithResources(t *testing.T) {
-	if _, err := exec.LookPath("gcc"); err != nil {
-		t.Skip("gcc unavailable")
-	}
-	if _, err := exec.LookPath("bsdtar"); err != nil {
-		t.Skip("bsdtar unavailable")
-	}
-	if _, err := exec.LookPath("patchelf"); err != nil {
-		t.Skip("patchelf unavailable")
-	}
-	home := isolate(t)
-	work := t.TempDir()
-
-	libSrc := "int e2e_fn(void){return 42;}\n"
-	os.WriteFile(filepath.Join(work, "e2e.c"), []byte(libSrc), 0644)
-	lib := filepath.Join(work, "libe2e.so.1.0")
-	cmd := exec.Command("gcc", "-shared", "-fPIC", "-Wl,-soname,libe2e.so.1", "-o", lib, filepath.Join(work, "e2e.c"))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("gcc lib: %v %s", err, out)
-	}
-	// The binary references its resources via an exe-relative path, like kitty.
-	appSrc := "extern int e2e_fn(void);\nconst char *e2e_res = \"../lib/e2eres/data.txt\";\nint main(int argc, char **argv){ (void)argc; (void)argv; (void)e2e_res; return e2e_fn(); }\n"
-	os.WriteFile(filepath.Join(work, "app.c"), []byte(appSrc), 0644)
-	binDir := filepath.Join(work, "bin")
-	os.MkdirAll(binDir, 0755)
-	appBin := filepath.Join(binDir, "appbin")
-	cmd = exec.Command("gcc", "-o", appBin, filepath.Join(work, "app.c"), "-L"+work, "-l:libe2e.so.1.0", "-Wl,-rpath,"+work)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("gcc app: %v %s", err, out)
-	}
-	// Host resource tree at <exedir>/../lib/e2eres.
-	resDir := filepath.Join(work, "lib", "e2eres")
-	os.MkdirAll(resDir, 0755)
-	if err := os.WriteFile(filepath.Join(resDir, "data.txt"), []byte("resource-bytes"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	pkgStaging := filepath.Join(work, "pkgroot")
-	os.MkdirAll(filepath.Join(pkgStaging, "usr", "lib"), 0755)
-	libBytes, _ := os.ReadFile(lib)
-	os.WriteFile(filepath.Join(pkgStaging, "usr", "lib", "libe2e.so.1"), libBytes, 0755)
-	pkginfo := "pkgname = e2elib\npkgver = 1.0-1\narch = x86_64\n"
-	os.WriteFile(filepath.Join(pkgStaging, ".PKGINFO"), []byte(pkginfo), 0644)
-	pkgFile := filepath.Join(work, "e2elib-1.0-1-x86_64.pkg.tar")
-	if out, err := exec.Command("bsdtar", "-cf", pkgFile, "-C", pkgStaging, "usr/lib/libe2e.so.1", ".PKGINFO").CombinedOutput(); err != nil {
-		t.Fatalf("bsdtar pkg: %v %s", err, out)
-	}
-	pkgBytes, _ := os.ReadFile(pkgFile)
-	h := sha256.Sum256(pkgBytes)
-	sha := hex.EncodeToString(h[:])
-
-	desc := "%FILENAME%\ne2elib-1.0-1-x86_64.pkg.tar\n\n%NAME%\ne2elib\n\n%VERSION%\n1.0-1\n\n%ARCH%\nx86_64\n\n%SHA256SUM%\n" + sha + "\n\n%PROVIDES%\nlibe2e.so=1-64\n"
-	dbBytes := gzipTar([]tarEntry{{"e2elib-1.0-1/desc", desc}})
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/core.db", func(w http.ResponseWriter, r *http.Request) { w.Write(dbBytes) })
-	mux.HandleFunc("/e2elib-1.0-1-x86_64.pkg.tar", func(w http.ResponseWriter, r *http.Request) { w.Write(pkgBytes) })
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
 	idx := repo.NewTestRepo("core", srv.URL, filepath.Join(home, "cache", "repo"), filepath.Join(home, "pkgcache"))
 	repo.OverrideDefault(idx)
 
-	if err := InstallElf(appBin, "e2eres", InstallOptions{}); err != nil {
-		t.Fatalf("InstallElf e2e resources: %v", err)
-	}
-	m, err := manifest.Load(filepath.Join(home, "apps", "e2eres"))
-	if err != nil {
+	if err := InstallRepoApp("e2eapp", "", "e2edry", InstallOptions{DryRun: true}); err != nil {
 		t.Fatal(err)
 	}
-	if !filepath.IsAbs(m.ExeRel) && m.ExeRel != filepath.Join("bin", "e2eres") {
-		t.Fatalf("manifest ExeRel = %q, want bin/e2eres", m.ExeRel)
+	if _, err := os.Stat(filepath.Join(home, "apps", "e2edry")); !os.IsNotExist(err) {
+		t.Fatal("dry-run created app dir")
 	}
-	link := filepath.Join(home, "bin", "e2eres")
-	fi, err := os.Lstat(link)
-	if err != nil {
-		t.Fatalf("bin entry missing: %v", err)
-	}
-	if fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("bin entry is not a symlink: %v", fi.Mode())
-	}
-	target, err := os.Readlink(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantTarget := filepath.Join(home, "exe", "e2eres", "bin", "e2eres")
-	if target != wantTarget {
-		t.Fatalf("symlink -> %q, want %q", target, wantTarget)
-	}
-	if _, err := os.Stat(filepath.Join(home, "exe", "e2eres", "bin", "e2eres")); err != nil {
-		t.Fatalf("real binary missing: %v", err)
-	}
-	if data, err := os.ReadFile(filepath.Join(home, "exe", "e2eres", "lib", "e2eres", "data.txt")); err != nil || string(data) != "resource-bytes" {
-		t.Fatalf("vendored resource = %q,%v", data, err)
-	}
-	// Running through the symlink must exec the app: exit code 42 comes from e2e_fn().
-	cmd = exec.Command(link)
-	// The app needs its lib: RPATH points at the app libs dir, so no env needed.
-	if err := cmd.Run(); err == nil {
-		t.Fatal("expected exit code 42, got 0")
-	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 42 {
-		t.Fatalf("symlink run = %v, want exit 42", err)
-	}
-	if err := Uninstall("e2eres"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(link); !os.IsNotExist(err) {
-		t.Fatal("symlink not removed on uninstall")
-	}
-	if _, err := os.Stat(filepath.Join(home, "exe", "e2eres")); !os.IsNotExist(err) {
-		t.Fatal("exe dir not removed on uninstall")
+	if _, err := os.Stat(filepath.Join(home, "exe", "e2edry")); !os.IsNotExist(err) {
+		t.Fatal("dry-run created exe dir")
 	}
 }
 
@@ -499,47 +252,6 @@ func TestBuildAndStageLocalLib(t *testing.T) {
 	os.WriteFile(filepath.Join(work, "lib", "notalib.so.txt"), []byte("nope"), 0644)
 	if m := buildLocalLibs([]string{work}); m["notalib.so.txt"] != "" {
 		t.Fatalf("non-ELF indexed: %v", m)
-	}
-}
-
-func TestSplitInstallArgs(t *testing.T) {
-	dir := t.TempDir()
-	file := filepath.Join(dir, "appbin")
-	os.WriteFile(file, []byte("x"), 0755)
-
-	// Straight order.
-	p, n, sw, err := SplitInstallArgs([]string{file, "myapp"})
-	if err != nil || p != file || n != "myapp" || sw {
-		t.Fatalf("straight = %q,%q,%v,%v", p, n, sw, err)
-	}
-	// Swapped: missing first arg, existing second.
-	p, n, sw, err = SplitInstallArgs([]string{"myapp", file})
-	if err != nil || p != file || n != "myapp" || !sw {
-		t.Fatalf("swapped = %q,%q,%v,%v", p, n, sw, err)
-	}
-	// Swapped with existing folder first (the `install kitty ./kitty/bin/kitty`
-	// shape): the second arg can't be a name, so names/paths swap.
-	t.Chdir(dir)
-	os.MkdirAll("myapp/bin", 0755)
-	os.WriteFile(filepath.Join("myapp", "bin", "prog"), []byte("x"), 0755)
-	p, n, sw, err = SplitInstallArgs([]string{"myapp", filepath.Join("myapp", "bin", "prog")})
-	if err != nil || n != "myapp" || !sw {
-		t.Fatalf("name-first swap = %q,%q,%v,%v", p, n, sw, err)
-	}
-	if _, err := os.Stat(p); err != nil {
-		t.Fatalf("swapped path does not exist: %q", p)
-	}
-	// Missing path.
-	if _, _, _, err := SplitInstallArgs([]string{filepath.Join(dir, "nope"), "x"}); err == nil {
-		t.Fatal("expected missing-path error")
-	}
-	// Too many args.
-	if _, _, _, err := SplitInstallArgs([]string{"a", "b", "c"}); err == nil {
-		t.Fatal("expected too-many-args error")
-	}
-	// None.
-	if _, _, _, err := SplitInstallArgs(nil); err == nil {
-		t.Fatal("expected missing-path error")
 	}
 }
 
@@ -614,23 +326,6 @@ func TestResolveMainExePrefersLauncherScript(t *testing.T) {
 	}
 	if rel, err := resolveMainExe(elfOnly, "tool"); err != nil || rel != "tool" {
 		t.Fatalf("elf main = %q,%v", rel, err)
-	}
-}
-
-func TestElectronBundleDir(t *testing.T) {
-	dir := t.TempDir()
-	exe := filepath.Join(dir, "codium")
-	os.WriteFile(exe, []byte("\x7fELF"), 0755)
-	if _, ok := electronBundleDir(exe); ok {
-		t.Fatal("bare dir reported as bundle")
-	}
-	os.WriteFile(filepath.Join(dir, "icudtl.dat"), []byte("x"), 0644)
-	if _, ok := electronBundleDir(exe); ok {
-		t.Fatal("half bundle reported as bundle")
-	}
-	os.WriteFile(filepath.Join(dir, "resources.pak"), []byte("x"), 0644)
-	if got, ok := electronBundleDir(exe); !ok || got != dir {
-		t.Fatalf("bundle = %q,%v", got, ok)
 	}
 }
 
@@ -800,8 +495,8 @@ func TestInstallDirE2E(t *testing.T) {
 	idx := repo.NewTestRepo("core", srv.URL, filepath.Join(home, "cache", "repo"), filepath.Join(home, "pkgcache"))
 	repo.OverrideDefault(idx)
 
-	if err := InstallElf(folder, "", InstallOptions{}); err != nil {
-		t.Fatalf("InstallElf folder: %v", err)
+	if err := installDir(folder, "folderapp", InstallOptions{}); err != nil {
+		t.Fatalf("installDir folder: %v", err)
 	}
 	m, err := manifest.Load(filepath.Join(home, "apps", "folderapp"))
 	if err != nil {
@@ -892,8 +587,8 @@ func TestInstallDirRepoFallbackE2E(t *testing.T) {
 	repo.OverrideDefault(idx)
 
 	var out bytes.Buffer
-	if err := InstallElf(folder, "", InstallOptions{Out: &out}); err != nil {
-		t.Fatalf("InstallElf folder fallback: %v\n%s", err, out.String())
+	if err := installDir(folder, "fbapp", InstallOptions{Out: &out}); err != nil {
+		t.Fatalf("installDir folder fallback: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "[repo-fallback] libfb.so.1") {
 		t.Fatalf("no repo fallback in output:\n%s", out.String())
