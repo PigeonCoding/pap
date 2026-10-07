@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"pap/internal/config"
@@ -155,6 +156,32 @@ func TestLoadReposPrefersCustomMirrorlist(t *testing.T) {
 	}
 	if slices.Contains(byName["chaotic-aur"], want[0]) {
 		t.Errorf("chaotic-aur servers = %v, must not use the Arch mirrors", byName["chaotic-aur"])
+	}
+}
+
+func TestEnsureMirrorlist(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "mirrorlist")
+	orig := config.Mirrorlist
+	config.Mirrorlist = file
+	t.Cleanup(func() { config.Mirrorlist = orig })
+
+	EnsureMirrorlist()
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("mirrorlist not created: %v", err)
+	}
+	if !strings.Contains(string(data), "Server = ") {
+		t.Fatalf("seeded mirrorlist has no servers:\n%s", data)
+	}
+
+	// An existing file (user edits) is never overwritten.
+	custom := "Server = https://custom.example/$repo/os/$arch\n"
+	if err := os.WriteFile(file, []byte(custom), 0644); err != nil {
+		t.Fatal(err)
+	}
+	EnsureMirrorlist()
+	if data, err := os.ReadFile(file); err != nil || string(data) != custom {
+		t.Fatalf("existing mirrorlist touched: %q,%v", data, err)
 	}
 }
 

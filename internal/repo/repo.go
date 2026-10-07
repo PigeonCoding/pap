@@ -158,6 +158,61 @@ func loadRepos() []repoDef {
 	return defs
 }
 
+// EnsureMirrorlist populates the pap-only mirrorlist (~/.pap/mirrorlist) on
+// first launch, seeded from the system's configured mirrors. The file is an
+// override for the official Arch repos (chaotic-aur keeps its own servers);
+// an existing file is never touched, so user edits are safe.
+func EnsureMirrorlist() {
+	path := config.Mirrorlist
+	if _, err := os.Stat(path); err == nil {
+		return
+	}
+	var servers []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s != "" && !seen[s] {
+			seen[s] = true
+			servers = append(servers, s)
+		}
+	}
+	conf := parsePacmanConf()
+	for _, name := range wantedRepos {
+		if name == "chaotic-aur" {
+			continue
+		}
+		for _, s := range conf[name] {
+			add(s)
+		}
+	}
+	if len(servers) == 0 {
+		for _, s := range loadMirrors() {
+			add(s)
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString("# pap mirrors: override for the official Arch repos " +
+		"(core/extra/multilib).\n# Seeded from your system mirrors on first launch; " +
+		"edit or reorder the Server lines to pin pap.\n# chaotic-aur keeps its own servers and ignores this file.\n")
+	for _, s := range servers {
+		sb.WriteString("Server = " + s + "\n")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return
+	}
+	// O_EXCL: a concurrent pap process may have just placed it; never
+	// clobber.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	_, werr := f.WriteString(sb.String())
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		os.Remove(path)
+	}
+}
+
 // parsePacmanConf extracts each repo section's Server and Include lines from
 // /etc/pacman.conf, keyed by repo name.
 func parsePacmanConf() map[string][]string {

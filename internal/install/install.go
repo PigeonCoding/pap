@@ -69,6 +69,7 @@ func Doctor() error {
 	if err := Preflight(); err != nil {
 		return err
 	}
+	repo.EnsureMirrorlist()
 	for _, d := range []string{config.AppsDir, config.ExeDir, config.StoreDir, config.PkgCacheDir, config.RepoCacheDir, config.BinDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			return fmt.Errorf("cannot create %s: %w", d, err)
@@ -172,6 +173,7 @@ func prepareInstall(name string, force bool) error {
 	if err := store.Init(); err != nil {
 		return err
 	}
+	repo.EnsureMirrorlist()
 	if err := os.MkdirAll(config.AppsDir, 0755); err != nil {
 		return err
 	}
