@@ -144,7 +144,7 @@ func main() {
 			fail(err)
 		}
 	case "--version", "-V", "version":
-		fmt.Printf("pap %s (arch %s)\n", install.Version, config.Arch)
+		fmt.Printf("pap %s %s\n", install.Version, config.Arch)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		usage()
