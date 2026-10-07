@@ -220,6 +220,38 @@ func TestFindRepoMainExe(t *testing.T) {
 	}
 }
 
+// A script shipped beside the real binary (corepack next to node) only wraps
+// it and execs a name the host PATH may not have, so the fallback must pick
+// the ELF. Scripts remain valid when the package ships no ELF at all.
+func TestFindRepoMainExePrefersELFOverScript(t *testing.T) {
+	payload := t.TempDir()
+	bindir := filepath.Join(payload, "usr", "bin")
+	if err := os.MkdirAll(bindir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	elfBytes, err := os.ReadFile(hostELFPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bindir, "corepack"), []byte("#!/usr/bin/env node\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bindir, "node"), elfBytes, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// corepack sorts before node; the ELF still wins.
+	if rel, err := findRepoMainExe(payload, "nodejs", "node_old"); err != nil || rel != filepath.Join("usr", "bin", "node") {
+		t.Fatalf("main = %q, %v, want usr/bin/node", rel, err)
+	}
+	// Script-only packages fall back to the script as before.
+	if err := os.Remove(filepath.Join(bindir, "node")); err != nil {
+		t.Fatal(err)
+	}
+	if rel, err := findRepoMainExe(payload, "nodejs", "node_old"); err != nil || rel != filepath.Join("usr", "bin", "corepack") {
+		t.Fatalf("script-only main = %q, %v, want usr/bin/corepack", rel, err)
+	}
+}
+
 func TestSplitPinnedPackage(t *testing.T) {
 	name, ver, ok := splitPinnedPackage("core/curl 8.11.1-3")
 	if !ok || name != "curl" || ver != "8.11.1-3" {

@@ -96,8 +96,9 @@ func InstallRepoApp(pkgName, version, name string, opts InstallOptions) error {
 }
 
 // findRepoMainExe locates the app binary inside an extracted package payload:
-// usr/bin/<app>, usr/bin/<pkg>, then usr/sbin, then the first executable
-// ELF/script under usr/bin. Library-only packages have no entrypoint.
+// usr/bin/<app>, usr/bin/<pkg>, usr/sbin/<app>, usr/sbin/<pkg>, else the first
+// ELF under usr/bin, usr/sbin or usr — a script only when the package ships no
+// ELF at all. Library-only packages have no entrypoint.
 func findRepoMainExe(payload, pkgName, appName string) (string, error) {
 	for _, rel := range []string{
 		filepath.Join("usr", "bin", appName),
@@ -112,22 +113,32 @@ func findRepoMainExe(payload, pkgName, appName string) (string, error) {
 			}
 		}
 	}
-	for _, dir := range []string{filepath.Join("usr", "bin"), filepath.Join("usr", "sbin"), "usr"} {
-		root := filepath.Join(payload, dir)
-		entries, err := os.ReadDir(root)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if e.IsDir() {
+	// No name match: the package's own command is the ELF in its bin dir.
+	// A script shipped beside it (corepack, npm, ...) only wraps that ELF
+	// and would exec a name the host PATH does not have, so scripts count
+	// as a candidate only when the package ships no ELF at all.
+	for _, wantELF := range []bool{true, false} {
+		for _, dir := range []string{filepath.Join("usr", "bin"), filepath.Join("usr", "sbin"), "usr"} {
+			root := filepath.Join(payload, dir)
+			entries, err := os.ReadDir(root)
+			if err != nil {
 				continue
 			}
-			p := filepath.Join(root, e.Name())
-			st, err := os.Stat(p)
-			if err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
-				continue
-			}
-			if elf.IsELF(p) || elf.IsScript(p) {
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				p := filepath.Join(root, e.Name())
+				st, err := os.Stat(p)
+				if err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+					continue
+				}
+				if isELF := elf.IsELF(p); isELF != wantELF {
+					continue
+				}
+				if !wantELF && !elf.IsScript(p) {
+					continue
+				}
 				rel, _ := filepath.Rel(payload, p)
 				return rel, nil
 			}
