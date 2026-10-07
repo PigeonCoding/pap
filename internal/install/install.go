@@ -23,7 +23,7 @@ import (
 )
 
 // Version is the binary version (overridden via ldflags).
-var Version = "0.2"
+var Version = "0.3"
 
 // InstallOptions controls install behavior.
 type InstallOptions struct {
