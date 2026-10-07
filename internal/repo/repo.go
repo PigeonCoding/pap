@@ -850,9 +850,13 @@ func parseFilesZstdDb(repoName, dbFile string) (map[string][]PkgInfo, error) {
 	return out, err
 }
 
-// addLibFiles indexes the shared objects pkg ships under usr/lib — the tree
-// extractLibs can stage — keyed by basename, which is what a NEEDED entry
-// refers to. Directories are listed with a trailing slash and skipped.
+// addLibFiles indexes the shared objects pkg ships directly in usr/lib — the
+// only location extractLibs can promote to the loadable soname the app's
+// loader searches — keyed by basename, which is what a NEEDED entry refers
+// to. A copy inside a private subdir (usr/lib/kitty/libfoo.so.1) is never a
+// provider: staging it there leaves the soname unresolved, so indexing it
+// would shadow the package that really ships it. Directories are listed with
+// a trailing slash and skipped.
 func addLibFiles(out map[string][]PkgInfo, pkg PkgInfo, files string) {
 	const prefix = "usr/lib/"
 	for _, line := range strings.Split(files, "\n") {
@@ -861,11 +865,8 @@ func addLibFiles(out map[string][]PkgInfo, pkg PkgInfo, files string) {
 			continue
 		}
 		base := strings.TrimPrefix(line, prefix)
-		if base == "" || strings.HasSuffix(base, "/") {
-			continue
-		}
-		if i := strings.LastIndex(base, "/"); i >= 0 {
-			base = base[i+1:] // plugin subdir, e.g. usr/lib/kitty/libfoo.so.1
+		if base == "" || strings.Contains(base, "/") {
+			continue // directory entry or private subdir copy
 		}
 		if !strings.Contains(base, ".so") {
 			continue

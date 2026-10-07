@@ -128,6 +128,37 @@ func TestProvidersFallsBackToFileIndex(t *testing.T) {
 	}
 }
 
+// A copy of a soname inside a package's own lib subdir is not a provider:
+// extractLibs can only satisfy a top-level usr/lib/<soname>, so advertising
+// the private copy would shadow the package that really ships the library.
+func TestFileIndexIgnoresPrivateSubdirCopies(t *testing.T) {
+	idx := testIndex(t,
+		[]tarEntry{
+			{"icu-76.1-1/desc", desc("icu", "76.1-1", "")},
+			{"nsight-systems-2026.3.2.476-1/desc", desc("nsight-systems", "2026.3.2.476-1", "")},
+		},
+		[]tarEntry{
+			{"icu-76.1-1/desc", desc("icu", "76.1-1", "")},
+			{"icu-76.1-1/files", "%FILES%\nusr/\nusr/lib/\nusr/lib/libicui18n.so.76\n"},
+			{"nsight-systems-2026.3.2.476-1/desc", desc("nsight-systems", "2026.3.2.476-1", "")},
+			{"nsight-systems-2026.3.2.476-1/files",
+				"%FILES%\nusr/\nusr/lib/\nusr/lib/nsight-systems/\n" +
+					"usr/lib/nsight-systems/host-linux-x64/libicui18n.so.76\n" +
+					"usr/lib/nsight-systems/host-linux-x64/libqt6core.so.6\n"},
+		},
+	)
+	if err := idx.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	if providers := idx.Providers("libicui18n.so.76"); len(providers) != 1 || providers[0].Name != "icu" {
+		t.Fatalf("Providers(libicui18n.so.76) = %+v, want exactly [icu]", providers)
+	}
+	if providers := idx.Providers("libqt6core.so.6"); len(providers) != 0 {
+		t.Fatalf("Providers(libqt6core.so.6) = %+v, want none: the copy is private to a subdir", providers)
+	}
+}
+
 func TestLoadReposPrefersCustomMirrorlist(t *testing.T) {
 	want := []string{
 		"https://fastly.example/$repo/os/$arch",

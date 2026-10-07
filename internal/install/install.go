@@ -1630,7 +1630,10 @@ func neededFromTree(root string) []string {
 	return out
 }
 
-// copyTree replicates src dir at dst, preserving symlinks and file modes.
+// copyTree replicates src dir at dst, preserving symlinks, file modes and
+// mtimes. The mtimes matter: ArchiveDateFromRoots derives the ALA snapshot
+// date (the era the payload's dependencies must resolve against) from them,
+// so a copy that reset them to "now" would pin every install to today.
 func copyTree(src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -1680,7 +1683,10 @@ func copyTree(src, dst string) error {
 		if err := os.WriteFile(target, data, mode); err != nil {
 			return err
 		}
-		return os.Chmod(target, mode)
+		if err := os.Chmod(target, mode); err != nil {
+			return err
+		}
+		return os.Chtimes(target, fi.ModTime(), fi.ModTime())
 	})
 }
 

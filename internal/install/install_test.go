@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"pap/internal/config"
 	"pap/internal/elf"
@@ -166,6 +167,34 @@ func TestCopyTreePreservesSymlinks(t *testing.T) {
 	}
 	if target, err := os.Readlink(filepath.Join(dst, "link.txt")); err != nil || target != "a.txt" {
 		t.Fatalf("symlink = %q,%v", target, err)
+	}
+}
+
+// copyTree must carry mtimes across: ArchiveDateFromRoots reads them to pick
+// the ALA snapshot era for dependency resolution, and a copy that reset them
+// would resolve every payload against today's repos.
+func TestCopyTreePreservesMtimes(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "bin.elf"), []byte("data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	mt := time.Date(2025, 9, 30, 22, 34, 14, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(src, "bin.elf"), mt, mt); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "dst")
+	if err := copyTree(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(filepath.Join(dst, "bin.elf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.ModTime().Equal(mt) {
+		t.Errorf("copied mtime = %v, want %v", st.ModTime(), mt)
+	}
+	if got := repo.ArchiveDateFromRoots([]string{filepath.Join(dst, "bin.elf")}); !got.Equal(mt) {
+		t.Errorf("ArchiveDateFromRoots = %v, want %v", got, mt)
 	}
 }
 
