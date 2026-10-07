@@ -2,208 +2,186 @@
 
 Per-app library isolation for ELF binaries on Arch Linux.
 
-Give it any ELF file: it resolves every non-host library the binary needs
-(recursively), downloads the exact packages that provide them straight from the
-Arch repo mirrors, vendors the `.so` files into a content-addressed store, and
-patches the binary's `RPATH` to a private `libs/` folder. Library overlap
-between apps is solved by deduplication; nothing touches `pacman` or the system
-package database.
+Give it an ELF, a script, or an app folder: it resolves every non-host
+library recursively, downloads the exact packages from Arch mirrors, vendors
+the `.so` files into a content-addressed store, and patches `RPATH` to a
+private `libs/` folder.
 
-Naming is unified on `pap`: module `pap`, binary `pap`, state `~/.pap`
-(`PAP_HOME` overrides the state dir for isolation/tests).
+State lives in `~/.pap` (`PAP_HOME` overrides it).
 
 ## Requirements
 
-- Arch Linux (pacman repos: `core`, `extra`, `multilib`, `chaotic-aur`)
-- `bsdtar` (`libarchive`) — package extraction and index handling
-- `patchelf` — RPATH rewriting (with an `LD_LIBRARY_PATH` launcher fallback)
-- Go 1.27+ (to build)
-
-```sh
-sudo pacman -S libarchive patchelf
-```
-
-## How it works
-
-```
-input path: ELF file, shebang script, or app folder
-  │  files/scripts pass through; folders resolve their main executable
-  │  (<folder>/<name>, or the single top-level ELF) and are copied verbatim
-  ▼
-input ELF
-  │  readelf-equivalent: DT_NEEDED (recursive, BFS)
-  ▼
-sonames ──► repo index (.db: core/extra/multilib/chaotic-aur, %PROVIDES% → soname map;
-             undeclared sonames fall back to the .files index)
-  ▼
-exact pkg name-version-arch ──► download from mirror (version-pinned URL)
-  ▼
-verify .PKGINFO (pkgname/pkgver/arch) ──► extract usr/lib/*
-  ▼
-store/<sha256>  ◄──symlinks──  apps/<name>/libs/
-  ▼
-binary: patchelf RPATH to absolute ~/.pap/apps/<name>/libs (+ orig RPATH kept)
-vendored libs with own RUNPATH: patchelf --force-rpath '$ORIGIN'
-  ▼
-~/.pap/exe/<name>/…  ◄──symlink──  ~/.local/bin/<name>
-```
-
-- **Resolution** uses Arch's own mechanism: packages declare
-  `provides=(libcurl.so=4-64)`, which maps 1:1 to the `SONAME` the ELF asks
-  for. No `ldd` (it executes code), no `pacman -F`.
-- **Bundled libraries win**: `.so` files shipped next to the source (bundle
-  `lib/` dirs, the binary's own `$ORIGIN` RPATH entries, folder payloads)
-  are staged as-is and never re-downloaded — the bundle is self-consistent
-  (upstream kitty ships a patched libpython with private symbols the repo
-  build lacks). Repo downloads are the fallback; a corrupt bundled copy
-  falls back to the repo too.
-- **Repositories**: official Arch repos (`core`, `extra`, `multilib`) plus
-  `chaotic-aur` only — third-party repos from `pacman.conf` (cachyos,
-  lizardbyte, ...) are ignored. Servers come from `~/.pap/mirrorlist` when it
-  exists (a pap-only override for the official repos; chaotic-aur keeps its own
-  mirrors), else `pacman.conf` / the system mirrorlist; each repo's `.db` is
-  cached with a TTL and downloads are pinned to the mirror that served the
-  index.
-- **Version pinning + checksum**: the download URL is built from the exact
-  `%FILENAME%` in the repo `.db` and the payload is verified against the
-  index's `SHA256SUM`. Before anything is extracted, the archive's `.PKGINFO`
-  is checked against the expected pkgname/pkgver/arch — a stale mirror serving
-  a different file fails the install instead of silently installing the wrong
-  lib.
-- **Symbol version check**: the binary's `.gnu.version_r` (VERNEED) and every
-  extracted lib's are verified against the provider's `.gnu.version_d`
-  (VERDEF). If the ELF needs a newer glibc than the host provides,
-  you get a clear error before install completes.
-- **`DT_RPATH`, not `RUNPATH`**: glibc does not inherit `RUNPATH` into
-  transitive dependency lookups, but it does walk `DT_RPATH` up the loading
-  chain. `patchelf --force-rpath` is what makes all N levels load from
-  `libs/` — with plain `--set-rpath` only direct dependencies are isolated.
-  The installed binary gets an **absolute** RPATH to its
-  app dir; vendored libs with their own RUNPATH are rewritten to `$ORIGIN`
-  so they stay inside `libs/`.
-- **`~/.local/bin` holds symlinks**: the real binary lives under
-  `~/.pap/exe/<name>/` and is linked into `~/.local/bin`. The kernel resolves
-  the symlink for `/proc/self/exe`, so exe-relative lookups behave exactly as
-  on PATH — with no launcher process and `argv[0]` untouched. `pap` never edits
-  your shell rc unless you pass `--add-path`.
-
-## Layout
-
-```
-~/.local/bin/<name>        symlink → ~/.pap/exe/<name>/… (on PATH)
-
-$HOME/.pap/
-├── apps/<name>/
-│   ├── libs/             symlinks named by SONAME → store (per-app, saves space)
-│   └── manifest.json     libs + locked package versions (repo/name: version) + source sha256
-├── exe/<name>/
-│   ├── bin/<name>        the patched binary (single-file installs; PATH symlink target)
-│   ├── pkg/…             folder installs: source tree copied verbatim (symlink target inside)
-│   └── lib/… share/…    vendored exe-relative resource trees (e.g. lib/kitty)
-├── store/
-│   └── <sha256>          content-addressed (sha256 of file bytes), shared, GC-able
-├── pkgcache/             downloaded packages keyed by %FILENAME%
-├── cache/repo/           repo .db/.files indexes (XDG ~/.cache/pap outside PAP_HOME)
-├── mirrorlist            optional pap-only mirrors for core/extra/multilib
-└── lock                  cross-process flock
-```
+- libarchive 
+- patchelf  # bsdtar + patchelf
+- Go 1.27+ to build
 
 ## Usage
 
 ```sh
 go build -o pap ./cmd/pap
 
-pap install [--force] [--dry-run] [--quiet] [--add-path] [--exe <rel>] <path> [name]  # isolate an ELF, script, or app folder
-# --exe pins the folder entrypoint explicitly (path relative to the folder);
-# otherwise <folder>/<name> (or <folder>/bin/<name>) wins, scripts beat ELFs
-pap reinstall <name>                 # reinstall from source, pinned to manifest versions
-pap upgrade <name>                   # reinstall, re-resolving to current repo versions
-pap list                             # installed apps
-pap info <name>                      # manifest, source, pinned versions
-pap uninstall <name>                 # remove app (only removes binaries pap placed) + GC
-pap gc                               # drop store entries no app references
-pap doctor                           # check bsdtar/patchelf + state dirs
-pap version                          # print version
+pap install [--force] [--dry-run] [--quiet] [--add-path] [--exe <rel>] <path> [name]
+pap reinstall <name>   # reinstall from source, pinned to manifest versions
+pap upgrade <name>     # reinstall, re-resolving to current repo versions
+pap list | pap info <name> | pap uninstall <name> | pap gc | pap doctor | pap version
 ```
 
-Example:
+Folder entrypoint: `<folder>/<name>` (or `<folder>/bin/<name>`), scripts beat
+ELFs; `--exe <rel>` pins it explicitly. Every bundled ELF gets patched, so a
+script main stays local too.
 
-```console
-$ pap install /usr/bin/curl curl
-Installing curl from /usr/bin/curl
+`PAP_BIN_DIR` overrides the bin dir. `--dry-run` prints the resolve plan
+without changing anything; `--force` swaps atomically via `.bak`.
+
+## Example
+
+```sh
+$ wget https://github.com/kovidgoyal/kitty/releases/download/v0.49.2/kitty-0.49.2-x86_64.txz
+$ mkdir kitty
+$ cd kitty
+$ tar xvf ../kitty-0.49.2-x86_64.txz
+$ ➜  probe ./pap/pap install --add-path ./kitty --exe bin/kitty kitty
+Installing kitty from kitty (main executable: bin/kitty)
+Direct NEEDED: [libpython3.14.so.1.0 libc.so.6]
+Copying folder...
 
 Resolving dependencies (recursive)...
-  [ ok ] libcurl.so.4 -> core/curl 8.22.0-1
-  [ ok ] libnghttp2.so.14 -> core/libnghttp2 1.70.0-1
-  ... 22 transitive libs ...
-Checking dependency compatibility...
+  note: libpython3.14.so.1.0 is not declared in package metadata; loading repo file indexes (downloaded once, then cached)
+  [local] libpython3.14.so.1.0 -> kitty/lib/libpython3.14.so.1.0
+  [local] libslang-compiler.so.0.0.0.0 -> kitty/lib/libslang-compiler.so
+  [ ok ] libstdc++.so.6 -> core/libstdc++ 16.2.1+r23+gd564253eb6c8-1
+  [ ok ] libgcc_s.so.1 -> core/libgcc 16.2.1+r23+gd564253eb6c8-1
+  [local] libbz2.so.1.0 -> kitty/lib/libbz2.so.1.0
+  [local] libffi.so.8 -> kitty/lib/libffi.so.8
+  [local] libncursesw.so.6 -> kitty/lib/libncursesw.so.6
+  [ ok ] libpanelw.so.6 -> core/ncurses 6.6-2
+  [local] libcrypto.so.3 -> kitty/lib/libcrypto.so.3
+  [local] liblzma.so.5 -> kitty/lib/liblzma.so.5
+  [ ok ] libsqlite3.so -> core/sqlite 3.53.4-1
+  [local] libssl.so.3 -> kitty/lib/libssl.so.3
+  [ ok ] libuuid.so.1 -> core/util-linux-libs 2.42.4-1
+  [local] libz.so.1 -> kitty/lib/libz.so.1
+  [local] libxxhash.so.0 -> kitty/lib/libxxhash.so.0
+  [local] libcairo.so.2 -> kitty/lib/libcairo.so.2
+  [local] libfreetype.so.6 -> kitty/lib/libfreetype.so.6
+  [local] libharfbuzz.so.0 -> kitty/lib/libharfbuzz.so.0
+  [local] libpng16.so.16 -> kitty/lib/libpng16.so.16
+  [local] liblcms2.so.2 -> kitty/lib/liblcms2.so.2
+  [local] libwayland-client.so.0 -> kitty/lib/libwayland-client.so.0
+  [local] libxkbcommon.so.0 -> kitty/lib/libxkbcommon.so.0
+  [ ok ] libdbus-1.so.3 -> core/dbus 1.16.2-1
+  [ ok ] libX11.so.6 -> extra/libx11 1.8.13-2
+  [ ok ] libXcursor.so.1 -> extra/libxcursor 1.2.3-1
+  [local] libxkbcommon-x11.so.0 -> kitty/lib/libxkbcommon-x11.so.0
+  [ ok ] libX11-xcb.so.1 -> extra/libx11 1.8.13-2
+  [local] libexpat.so.1 -> kitty/lib/libexpat.so.1
+  [local] libreadline.so.8 -> kitty/lib/libreadline.so.8
+  [local] libbrotlicommon.so.1 -> kitty/lib/libbrotlicommon.so.1
+  [ ok ] libfontconfig.so.1 -> extra/fontconfig 2:2.18.3-2
+  [local] libpixman-1.so.0 -> kitty/lib/libpixman-1.so.0
+  [local] libbrotlidec.so.1 -> kitty/lib/libbrotlidec.so.1
+  [local] libiconv.so.2 -> kitty/lib/libiconv.so.2
+  [local] libpcre2-8.so.0 -> kitty/lib/libpcre2-8.so.0
+  [ ok ] libxcb.so.1 -> extra/libxcb 1.17.0-1
+  [ ok ] libxcb-xkb.so.1 -> extra/libxcb 1.17.0-1
+  [ ok ] libsystemd.so.0 -> core/systemd-libs 262-1
+  [ ok ] libXrender.so.1 -> extra/libxrender 0.9.12-1
+  [ ok ] libXfixes.so.3 -> extra/libxfixes 6.0.2-1
+  [ ok ] libXau.so.6 -> extra/libxau 1.0.12-1
+  [ ok ] libXdmcp.so.6 -> extra/libxdmcp 1.1.5-2
 
-Done. Run: /home/you/.local/bin/curl
+Patching vendored libs with their own RUNPATH...
+
+Checking dependency compatibility...
+  [repo-fallback] libncursesw.so.6: bundled copy incompatible, using repo build
+
+Resolving dependencies (recursive)...
+  [local] libpython3.14.so.1.0 -> kitty/lib/libpython3.14.so.1.0
+  [local] libslang-compiler.so.0.0.0.0 -> kitty/lib/libslang-compiler.so
+  [ ok ] libstdc++.so.6 -> core/libstdc++ 16.2.1+r23+gd564253eb6c8-1
+  [ ok ] libgcc_s.so.1 -> core/libgcc 16.2.1+r23+gd564253eb6c8-1
+  [local] libbz2.so.1.0 -> kitty/lib/libbz2.so.1.0
+  [local] libffi.so.8 -> kitty/lib/libffi.so.8
+  [ ok ] libncursesw.so.6 -> core/ncurses 6.6-2
+  [ ok ] libpanelw.so.6 -> core/ncurses 6.6-2
+  [local] libcrypto.so.3 -> kitty/lib/libcrypto.so.3
+  [local] liblzma.so.5 -> kitty/lib/liblzma.so.5
+  [ ok ] libsqlite3.so -> core/sqlite 3.53.4-1
+  [local] libssl.so.3 -> kitty/lib/libssl.so.3
+  [ ok ] libuuid.so.1 -> core/util-linux-libs 2.42.4-1
+  [local] libz.so.1 -> kitty/lib/libz.so.1
+  [local] libxxhash.so.0 -> kitty/lib/libxxhash.so.0
+  [local] libcairo.so.2 -> kitty/lib/libcairo.so.2
+  [local] libfreetype.so.6 -> kitty/lib/libfreetype.so.6
+  [local] libharfbuzz.so.0 -> kitty/lib/libharfbuzz.so.0
+  [local] libpng16.so.16 -> kitty/lib/libpng16.so.16
+  [local] liblcms2.so.2 -> kitty/lib/liblcms2.so.2
+  [local] libwayland-client.so.0 -> kitty/lib/libwayland-client.so.0
+  [local] libxkbcommon.so.0 -> kitty/lib/libxkbcommon.so.0
+  [ ok ] libdbus-1.so.3 -> core/dbus 1.16.2-1
+  [ ok ] libX11.so.6 -> extra/libx11 1.8.13-2
+  [ ok ] libXcursor.so.1 -> extra/libxcursor 1.2.3-1
+  [local] libxkbcommon-x11.so.0 -> kitty/lib/libxkbcommon-x11.so.0
+  [ ok ] libX11-xcb.so.1 -> extra/libx11 1.8.13-2
+  [local] libexpat.so.1 -> kitty/lib/libexpat.so.1
+  [local] libreadline.so.8 -> kitty/lib/libreadline.so.8
+  [local] libbrotlicommon.so.1 -> kitty/lib/libbrotlicommon.so.1
+  [ ok ] libfontconfig.so.1 -> extra/fontconfig 2:2.18.3-2
+  [local] libpixman-1.so.0 -> kitty/lib/libpixman-1.so.0
+  [local] libbrotlidec.so.1 -> kitty/lib/libbrotlidec.so.1
+  [local] libiconv.so.2 -> kitty/lib/libiconv.so.2
+  [local] libpcre2-8.so.0 -> kitty/lib/libpcre2-8.so.0
+  [ ok ] libxcb.so.1 -> extra/libxcb 1.17.0-1
+  [ ok ] libxcb-xkb.so.1 -> extra/libxcb 1.17.0-1
+  [ ok ] libsystemd.so.0 -> core/systemd-libs 262-1
+  [ ok ] libXrender.so.1 -> extra/libxrender 0.9.12-1
+  [ ok ] libXfixes.so.3 -> extra/libxfixes 6.0.2-1
+  [ ok ] libXau.so.6 -> extra/libxau 1.0.12-1
+  [ ok ] libXdmcp.so.6 -> extra/libxdmcp 1.1.5-2
+
+Patching vendored libs with their own RUNPATH...
+
+Checking dependency compatibility...
+Patching RPATH (113 bundled ELF(s))...
+
+Done. Run: /home/user/.local/bin/kitty
 ```
 
-After install, `ldd ~/.local/bin/curl` shows every non-glibc lib resolving
-into `~/.pap/apps/curl/libs/`.
+## How it works
 
-Env: `PAP_HOME` overrides `~/.pap` (isolation), `PAP_BIN_DIR` overrides the
-bin dir. `pap install --dry-run` prints the resolve plan without changing
-anything; `--force` swaps atomically via `.bak` so a failed overwrite never
-destroys the previous install.
+- Soname → package via `%PROVIDES%` (`.files` index fallback), no `ldd`.
+- Downloads are version-pinned and verified (`SHA256SUM` + `.PKGINFO` name/version/arch).
+- Bundled `.so` files win over repo downloads.
+- `patchelf --force-rpath` sets an absolute `RPATH` to `apps/<name>/libs`
+  (transitive deps need `RPATH`, not `RUNPATH`); vendored libs with their own
+  `RUNPATH` are rewritten to `$ORIGIN`.
+- Folders are copied verbatim under `exe/<name>/pkg/`; exe-relative
+  resources (`../lib/<app>`, companions, plugins) are vendored alongside.
+- `~/.local/bin/<name>` is a symlink to the real binary (scripts get a tiny
+  launcher so `$0` resolves into the payload). Shell rc is never edited
+  unless you pass `--add-path`.
 
-## Scope / limitations
+```
+~/.local/bin/<name>   →  ~/.pap/exe/<name>/… (on PATH)
+~/.pap/apps/<name>/   libs/ (SONAME symlinks → store) + manifest.json
+~/.pap/exe/<name>/    bin/<name> | pkg/… (folders) | lib/… share/… (resources)
+~/.pap/store/         content-addressed blobs (sha256), shared, GC-able
+```
 
-- **glibc and the ELF loader are not isolated** — the host provides
-  `libc.so.6`, `libm`, `libpthread`, `ld-linux`, etc. The VERNEED check is the
-  safety net: host glibc must satisfy the binary's symbol requirements.
-- **Every soname must map to a package that ships it** — packages declaring
-  `.so=` provides are preferred; sonames no package declares (e.g.
-  `libpython3.14.so.1.0`, which `python` ships without a provide) are looked up
-  in the repos' file indexes.
-- **`dlopen()` is partially covered** — plugin directories shipped under
-  `usr/lib/` (ossl-modules, gconv, NSS, ...) are vendored with their
-  relative layout, but absolute-path `dlopen` calls and plugins outside
-  `usr/lib` are not rewritten and won't be found.
-- **Exe-relative resources are vendored** — binaries that find data via
-  `../lib/<app>` / `../share/<app>` relative to their own path (e.g. kitty's
-  `/usr/lib/kitty`) get the host tree copied next to the installed copy
-  (`exe/<name>/lib/...`), their bundled extensions' `.so` deps resolved too.
-  Sibling trees composed at runtime (`%s/%s/kitty-extensions`) are included
-  when the binary mentions their name (never inside system lib dirs).
-  Companion executables next to the main binary (kitty's `kitten`) are
-  vendored the same way — matched by name against the binary plus vendored
-  resource contents — so runtime `exec` of siblings keeps working.
-  App folders (`pap install ./myapp`) are copied verbatim under `exe/<name>/pkg/`.
-- **GUI stacks are out of scope** for now.
-- All state lives under `$HOME/.pap` — `apps/` and `store/` are created on
-  first install (`gc`/`list` work from there too).
+## Limitations
 
-## Threat model
+- glibc and the loader stay on the host (VERNEED-checked); every other
+  soname must map to a package that ships it.
+- `dlopen()` is partially covered: plugin dirs under `usr/lib/` are vendored,
+  absolute-path `dlopen` is not.
+- GUI stacks are out of scope for now.
 
-- `SHA256SUM` comes from the **mirror-served index**, not a signed
-  database: it protects against accidental corruption / stale-mirror mixes
-  (plus the `.PKGINFO` name/version/arch check), but a malicious mirror
-  serving a consistent evil index + evil package would pass. `pacman` solves
-  this with GPG `SigLevel`/keyring verification of `.db.sig` + `.pkg.sig`;
-  `pap` does not verify signatures yet — use mirrors you trust for `pacman`
-  itself. Full `.sig`-against-`/etc/pacman.d/gnupg` verification is future
-  work.
-- Repo indexes live under `~/.cache/pap` (or `$PAP_HOME/cache`), downloads
-  use unpredictable temp names + `O_EXCL` + atomic rename; a cross-process
-  `flock` on `~/.pap/lock` serializes concurrent `pap` runs.
-- No `ldd` (never executes the target), no setuid propagation (copies drop
-  setuid/setgid bits, store modes are `0644`/`0755` only).
+## Security
 
-## Internals
-
-| Package             | Role                                                        |
-|---------------------|-------------------------------------------------------------|
-| `internal/elf`      | `DT_NEEDED`, VERNEED/VERDEF parsing (`debug/elf`)           |
-| `internal/repo`     | pacman.conf/mirrorlist servers, gzip+zstd `.db` parse, sha256-pinned downloads |
-| `internal/config`   | `~/.pap` paths (`PAP_HOME`), XDG cache, host architecture   |
-| `internal/lock`     | cross-process `flock` on `~/.pap/lock`                      |
-| `internal/resolver` | soname → package, arch-aware host-lib skip list             |
-| `internal/store`    | content-addressed store, symlinks, GC                       |
-| `internal/install`  | BFS install flow, `.PKGINFO` verify, compat check, patchelf |
-| `internal/manifest` | per-app manifest + locked package versions + source hash    |
+- No signatures: checksums come from the mirror-served index (corruption-safe,
+  not malicious-mirror-safe) — use mirrors you trust.
+- No `ldd` (targets are never executed), setuid bits are dropped, concurrent
+  runs are serialized with a `flock`.
 
 ## Development
 

@@ -11,9 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"pap/internal/config"
+	"pap/internal/elf"
 	"pap/internal/manifest"
 	"pap/internal/repo"
 )
@@ -819,6 +821,99 @@ func TestInstallDirE2E(t *testing.T) {
 		t.Fatal("expected exit code 42, got 0")
 	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 42 {
 		t.Fatalf("symlink run = %v, want exit 42", err)
+	}
+}
+
+// TestInstallDirRepoFallbackE2E covers the mixed-closure case: the folder
+// bundles libfb.so.1 WITHOUT the FB_1.0 symbol version, while the repo
+// build has it and the app's requirer needs it. The install must heal by
+// re-staging the soname from the repo instead of failing compat.
+func TestInstallDirRepoFallbackE2E(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("gcc unavailable")
+	}
+	if _, err := exec.LookPath("bsdtar"); err != nil {
+		t.Skip("bsdtar unavailable")
+	}
+	if _, err := exec.LookPath("patchelf"); err != nil {
+		t.Skip("patchelf unavailable")
+	}
+	home := isolate(t)
+	work := t.TempDir()
+
+	os.WriteFile(filepath.Join(work, "fb.c"), []byte("int fb_fn(void){return 7;}\n"), 0644)
+	os.WriteFile(filepath.Join(work, "fb.map"), []byte("FB_1.0 {\n  global: fb_fn;\n  local: *;\n};\n"), 0644)
+	// Repo build: versioned symbols.
+	repoLib := filepath.Join(work, "libfb.so.1.0")
+	cmd := exec.Command("gcc", "-shared", "-fPIC", "-Wl,-soname,libfb.so.1",
+		"-Wl,--version-script="+filepath.Join(work, "fb.map"), "-o", repoLib, filepath.Join(work, "fb.c"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("gcc versioned lib: %v %s", err, out)
+	}
+	os.WriteFile(filepath.Join(work, "app.c"), []byte("extern int fb_fn(void); int main(void){return fb_fn();}\n"), 0644)
+	folder := filepath.Join(work, "fbapp")
+	os.MkdirAll(folder, 0755)
+	cmd = exec.Command("gcc", "-o", filepath.Join(folder, "fbapp"), filepath.Join(work, "app.c"),
+		"-L"+work, "-l:libfb.so.1.0", "-Wl,-rpath,"+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("gcc app: %v %s", err, out)
+	}
+	// Bundled copy: same ABI, no symbol versions.
+	localLib := filepath.Join(folder, "libfb.so.1.0")
+	cmd = exec.Command("gcc", "-shared", "-fPIC", "-Wl,-soname,libfb.so.1", "-o", localLib, filepath.Join(work, "fb.c"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("gcc unversioned lib: %v %s", err, out)
+	}
+
+	pkgStaging := filepath.Join(work, "pkgroot")
+	os.MkdirAll(filepath.Join(pkgStaging, "usr", "lib"), 0755)
+	libBytes, _ := os.ReadFile(repoLib)
+	os.WriteFile(filepath.Join(pkgStaging, "usr", "lib", "libfb.so.1"), libBytes, 0755)
+	pkginfo := "pkgname = e2efb\npkgver = 1.0-1\narch = " + config.Arch + "\n"
+	os.WriteFile(filepath.Join(pkgStaging, ".PKGINFO"), []byte(pkginfo), 0644)
+	pkgFile := filepath.Join(work, "e2efb-1.0-1-"+config.Arch+".pkg.tar")
+	if out, err := exec.Command("bsdtar", "-cf", pkgFile, "-C", pkgStaging, "usr/lib/libfb.so.1", ".PKGINFO").CombinedOutput(); err != nil {
+		t.Fatalf("bsdtar pkg: %v %s", err, out)
+	}
+	pkgBytes, _ := os.ReadFile(pkgFile)
+	h := sha256.Sum256(pkgBytes)
+	sha := hex.EncodeToString(h[:])
+
+	desc := "%FILENAME%\ne2efb-1.0-1-" + config.Arch + ".pkg.tar\n\n%NAME%\ne2efb\n\n%VERSION%\n1.0-1\n\n%ARCH%\n" + config.Arch + "\n\n%SHA256SUM%\n" + sha + "\n\n%PROVIDES%\nlibfb.so=1-64\n"
+	dbBytes := gzipTar([]tarEntry{{"e2efb-1.0-1/desc", desc}})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/core.db", func(w http.ResponseWriter, r *http.Request) { w.Write(dbBytes) })
+	mux.HandleFunc("/e2efb-1.0-1-"+config.Arch+".pkg.tar", func(w http.ResponseWriter, r *http.Request) { w.Write(pkgBytes) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	idx := repo.NewTestRepo("core", srv.URL, filepath.Join(home, "cache", "repo"), filepath.Join(home, "pkgcache"))
+	repo.OverrideDefault(idx)
+
+	var out bytes.Buffer
+	if err := InstallElf(folder, "", InstallOptions{Out: &out}); err != nil {
+		t.Fatalf("InstallElf folder fallback: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "[repo-fallback] libfb.so.1") {
+		t.Fatalf("no repo fallback in output:\n%s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, "apps", "fbapp", "libs", "libfb.so.1")); err != nil {
+		t.Fatalf("vendored lib missing: %v", err)
+	}
+	// The staged copy must be the versioned repo build.
+	defs, err := elf.ParseVerdef(filepath.Join(home, "apps", "fbapp", "libs", "libfb.so.1"))
+	if err != nil {
+		t.Fatalf("ParseVerdef staged lib: %v", err)
+	}
+	if !defs["FB_1.0"] {
+		t.Fatalf("staged lib lacks FB_1.0: %v", defs)
+	}
+	link := filepath.Join(home, "bin", "fbapp")
+	if err := exec.Command(link).Run(); err == nil {
+		t.Fatal("expected exit code 7, got 0")
+	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 7 {
+		t.Fatalf("symlink run = %v, want exit 7", err)
 	}
 }
 func min(a, b int) int {

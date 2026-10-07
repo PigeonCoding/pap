@@ -331,16 +331,8 @@ func installFile(absExe, name string, opts InstallOptions, srcHash string) error
 		return err
 	}
 
-	installedLibs, privateLibs, usedPkgs, err := resolveAndStage(toResolve, libsDir, local, opts)
+	installedLibs, _, usedPkgs, err := resolveStageCompat([]string{absExe}, toResolve, libsDir, local, opts)
 	if err != nil {
-		return err
-	}
-	if err := patchPrivateLibs(privateLibs, libsDir); err != nil {
-		return err
-	}
-
-	opts.printf("\nChecking dependency compatibility...\n")
-	if err := checkCompat(absExe, libsDir); err != nil {
 		return err
 	}
 
@@ -544,14 +536,6 @@ func installDir(absDir, name string, opts InstallOptions) error {
 		return err
 	}
 
-	installedLibs, privateLibs, usedPkgs, err := resolveAndStage(toResolve, libsDir, local, opts)
-	if err != nil {
-		return err
-	}
-	if err := patchPrivateLibs(privateLibs, libsDir); err != nil {
-		return err
-	}
-
 	// Patch every ELF in the staged copy so each one resolves its deps
 	// from the private libs dir — not just the main entrypoint. A script
 	// main is left alone (no RPATH to patch); its ELF children still go local.
@@ -565,11 +549,10 @@ func installDir(absDir, name string, opts InstallOptions) error {
 		stagedELFs = append(stagedELFs, p)
 	}
 	stagedMain := filepath.Join(stageExe, exeRel)
-	opts.printf("\nChecking dependency compatibility...\n")
-	for _, p := range stagedELFs {
-		if err := checkCompat(p, libsDir); err != nil {
-			return err
-		}
+
+	installedLibs, _, usedPkgs, err := resolveStageCompat(stagedELFs, toResolve, libsDir, local, opts)
+	if err != nil {
+		return err
 	}
 
 	libsAbs := filepath.Join(config.AppsDir, name, "libs")
@@ -900,11 +883,14 @@ func finishInstall(stg *stager, name, exeRel string, opts InstallOptions) error 
 // resolveAndStage BFS-resolves sonames, downloading packages in parallel
 // per frontier and extracting sequentially for determinism. Sonames present
 // in local (libraries shipped next to the source) are staged from disk and
-// never downloaded: the bundle is self-consistent.
-func resolveAndStage(toResolve []string, libsDir string, local map[string]string, opts InstallOptions) (installed, private []string, usedPkgs map[string]string, err error) {
+// never downloaded: the bundle is self-consistent. localStaged reports which
+// sonames came from the bundle, so callers can re-stage them from the repo
+// when the bundled copy turns out to be incompatible.
+func resolveAndStage(toResolve []string, libsDir string, local map[string]string, opts InstallOptions) (installed, private []string, usedPkgs map[string]string, localStaged map[string]bool, err error) {
 	var installedLibs []string
 	var privateLibs []string
 	usedPkgs = map[string]string{}
+	localStaged = map[string]bool{}
 	seen := map[string]bool{}
 	var failures []string
 	lockMismatches := 0
@@ -989,6 +975,7 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 				if lerr == nil {
 					opts.printf("  [local] %s -> %s\n", soname, lp)
 					staged = true
+					localStaged[soname] = true
 				} else {
 					opts.printf("  [warn] %s: bundled copy unusable (%v); trying repo\n", soname, lerr)
 				}
@@ -1085,20 +1072,87 @@ func resolveAndStage(toResolve []string, libsDir string, local map[string]string
 
 	if len(failures) > 0 {
 		if lockMismatches > 0 && lockMismatches == len(failures) {
-			return nil, nil, nil, fmt.Errorf("cannot reinstall: locked versions gone from the repos (mirror pruned them):\n  %s\nrun upgrade to re-resolve to current versions", strings.Join(failures, "\n  "))
+			return nil, nil, nil, nil, fmt.Errorf("cannot reinstall: locked versions gone from the repos (mirror pruned them):\n  %s\nrun upgrade to re-resolve to current versions", strings.Join(failures, "\n  "))
 		}
-		return nil, nil, nil, fmt.Errorf("cannot install: unsatisfied dependencies:\n  %s", strings.Join(failures, "\n  "))
+		return nil, nil, nil, nil, fmt.Errorf("cannot install: unsatisfied dependencies:\n  %s", strings.Join(failures, "\n  "))
 	}
 	if freshPins > 0 {
 		opts.printf("  note: pinned %d new package(s) not in the previous manifest\n", freshPins)
 	}
-	return installedLibs, privateLibs, usedPkgs, nil
+	return installedLibs, privateLibs, usedPkgs, localStaged, nil
 }
 
 type dlTask struct {
 	soname string
 	pkg    repo.PkgInfo
 	key    string
+}
+
+// resolveStageCompat resolves and stages like resolveAndStage, then verifies
+// dependency compatibility from roots. A bundled library that breaks symbol
+// versioning for a repo library (e.g. kitty's libncursesw vs repo
+// libpanelw) is re-staged from the repo instead: such mixed closures crash
+// at runtime, so repo consistency wins over the bundle for that soname.
+// Retries are bounded; problems that no fallback heals fail as before.
+func resolveStageCompat(roots []string, toResolve []string, libsDir string, local map[string]string, opts InstallOptions) (installed, private []string, usedPkgs map[string]string, err error) {
+	usedPkgs = map[string]string{}
+	forced := map[string]bool{}
+	const maxRounds = 4
+	for round := 0; ; round++ {
+		active := local
+		if len(forced) > 0 {
+			active = map[string]string{}
+			for k, v := range local {
+				if !forced[k] {
+					active[k] = v
+				}
+			}
+		}
+		ins, priv, used, localStaged, rerr := resolveAndStage(toResolve, libsDir, active, opts)
+		if rerr != nil {
+			return nil, nil, nil, rerr
+		}
+		installed = append(installed, ins...)
+		private = append(private, priv...)
+		for k, v := range used {
+			usedPkgs[k] = v
+		}
+		if err := patchPrivateLibs(priv, libsDir); err != nil {
+			return nil, nil, nil, err
+		}
+		opts.printf("\nChecking dependency compatibility...\n")
+		problems := checkCompatDetailed(roots, libsDir)
+		if len(problems) == 0 {
+			return dedup(installed), dedup(private), usedPkgs, nil
+		}
+		var heal []string
+		seenHeal := map[string]bool{}
+		for _, p := range problems {
+			if p.Needed == "" || p.Provider == "" {
+				continue // unparseable or missing: no fallback exists
+			}
+			if !localStaged[p.Needed] || forced[p.Needed] || seenHeal[p.Needed] {
+				continue
+			}
+			if len(repo.Default().Providers(p.Needed)) == 0 {
+				continue
+			}
+			seenHeal[p.Needed] = true
+			heal = append(heal, p.Needed)
+		}
+		if len(heal) == 0 || round+1 >= maxRounds {
+			msgs := make([]string, len(problems))
+			for i, pr := range problems {
+				msgs[i] = pr.Error()
+			}
+			return nil, nil, nil, fmt.Errorf("dependency compatibility:\n  %s", strings.Join(msgs, "\n  "))
+		}
+		for _, s := range heal {
+			forced[s] = true
+			os.RemoveAll(filepath.Join(libsDir, s))
+			opts.printf("  [repo-fallback] %s: bundled copy incompatible, using repo build\n", s)
+		}
+	}
 }
 
 // lockInvolved reports whether any provider's package is mentioned in the
