@@ -198,6 +198,33 @@ func TestCopyTreePreservesMtimes(t *testing.T) {
 	}
 }
 
+func TestManifestSource(t *testing.T) {
+	// A repo install shows the package version the manifest recorded (the
+	// --pkg-version pin).
+	m := &manifest.Manifest{Source: "repo:nodejs", Package: "archive/nodejs 24.9.0-1"}
+	if got := manifestSource(m); got != "repo:nodejs (24.9.0-1)" {
+		t.Errorf("manifestSource = %q, want repo:nodejs (24.9.0-1)", got)
+	}
+	// Folder installs record no package: the source stands alone.
+	m = &manifest.Manifest{Source: "/home/u/src/myapp", Binary: "myapp"}
+	if got := manifestSource(m); got != "/home/u/src/myapp" {
+		t.Errorf("manifestSource = %q, want /home/u/src/myapp", got)
+	}
+	// No source at all falls back to the binary name.
+	m = &manifest.Manifest{Binary: "tool"}
+	if got := manifestSource(m); got != "tool" {
+		t.Errorf("manifestSource = %q, want tool", got)
+	}
+	// Overlong values keep their tail, so the version stays visible.
+	m = &manifest.Manifest{
+		Source:  "/home/u/src/a/quite/deeply/nested/project",
+		Package: "core/tool 1.2.3-4",
+	}
+	if got := manifestSource(m); !strings.HasPrefix(got, "…") || !strings.HasSuffix(got, "(1.2.3-4)") {
+		t.Errorf("manifestSource = %q, want a truncated tail ending in (1.2.3-4)", got)
+	}
+}
+
 func TestUninstallWithoutManifestLeavesBin(t *testing.T) {
 	home := isolate(t)
 	// Uninstall without manifest must NOT touch bin.

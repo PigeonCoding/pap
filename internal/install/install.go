@@ -1857,16 +1857,27 @@ func List() error {
 				vers += fmt.Sprintf(" (+%d more)", len(m.Packages)-2)
 			}
 		}
-		src := m.Source
-		if src == "" {
-			src = m.Binary
-		}
-		if len(src) > 28 {
-			src = "…" + src[len(src)-27:]
-		}
-		fmt.Printf("%-20s %-30s %-8d %s\n", m.Name, src, len(m.Libs), vers)
+		fmt.Printf("%-20s %-30s %-8d %s\n", m.Name, manifestSource(m), len(m.Libs), vers)
 	}
 	return nil
+}
+
+// manifestSource renders a manifest's SOURCE column: where the app came from,
+// plus the exact package version behind it when the install recorded one
+// (manifest.Package is "<repo>/<name> <version>", set for every repo app and
+// the record of a --pkg-version pin). The result is truncated to the column.
+func manifestSource(m *manifest.Manifest) string {
+	src := m.Source
+	if src == "" {
+		src = m.Binary
+	}
+	if _, ver, ok := splitPinnedPackage(m.Package); ok {
+		src += " (" + ver + ")"
+	}
+	if len(src) > 28 {
+		src = "…" + src[len(src)-27:]
+	}
+	return src
 }
 
 // Info prints one app's manifest, binary location and store usage.
