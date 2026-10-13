@@ -36,3 +36,25 @@ func TestSkipNSSWildcard(t *testing.T) {
 		t.Error("Skip(libcurl.so.4) = true, want false")
 	}
 }
+
+func TestHostGlibcLib(t *testing.T) {
+	// The vendored set under --force-libc: glibc family + loaders.
+	for _, s := range []string{
+		"libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2",
+		"librt.so.1", "libresolv.so.2", "libcrypt.so.2",
+		"ld-linux-x86-64.so.2", "ld-linux.so.2",
+	} {
+		if !HostGlibcLib(s) {
+			t.Errorf("HostGlibcLib(%q) = false, want true", s)
+		}
+	}
+	// Ordinary and isolatable libs are not part of the coupling.
+	for _, s := range []string{"libcurl.so.4", "libstdc++.so.6", "libz.so.1", "libnss_files.so.2"} {
+		if HostGlibcLib(s) {
+			t.Errorf("HostGlibcLib(%q) = true, want false", s)
+		}
+	}
+	if got := LoaderSonames("x86_64"); len(got) != 1 || got[0] != "ld-linux-x86-64.so.2" {
+		t.Fatalf("LoaderSonames(x86_64) = %v", got)
+	}
+}

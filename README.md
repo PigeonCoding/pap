@@ -19,17 +19,30 @@ State lives in `~/.pap` (`PAP_HOME` overrides it).
 ```sh
 go build -o pap ./cmd/pap
 
-pap install [--force] [--dry-run] [--quiet] [--pkg-version <ver>] <pkg> [name]
+pap install [options] <pkg> [name]
 pap reinstall <name>   # re-fetch the pinned package version
-pap upgrade <name>     # re-resolve to the live latest package version
+pap upgrade <name>     # re-resolve to the newest compatible package version
 pap add-path           # append ~/.local/bin to your shell rc
-pap list | pap info <name> | pap uninstall <name> | pap gc | pap doctor | pap version
+pap list | pap info <name> | pap remove <name> | pap gc | pap doctor | pap version
+pap help [command]     # show help (run `pap help install` for all options)
 ```
 
 `<pkg>` is a repo package name; `[name]` overrides the installed app name.
 `--pkg-version` pins an exact pkgver, fetched from the Arch Linux Archive
-when the mirrors no longer carry it. `pap install` is repo-only: there are
+when the mirrors no longer carry it (bypasses glibc auto-selection).
+`pap install` is repo-only: there are
 no file or folder inputs.
+
+By default pap installs the newest build your host glibc can run: when the
+live Arch build needs newer glibc than the host provides (common on
+Debian/stable), it walks back through the Arch Linux Archive and installs
+the newest compatible build, with dependencies resolved era-consistently.
+`--no-glibc-compat` disables that and takes the live latest Arch build.
+`--force-libc` instead vendors the Arch glibc + loader into the app and
+rewrites `PT_INTERP`, so the live latest build runs even on old distros —
+at the cost of a larger private `libs/` (shared blobs are deduplicated in
+the content-addressed store). The choice is recorded in the manifest, so
+reinstall/upgrade keep it.
 
 `PAP_BIN_DIR` overrides the bin dir. `--dry-run` prints the resolve plan
 without changing anything; `--force` swaps atomically via `.bak`.
@@ -59,6 +72,9 @@ Done. Run: /home/user/.local/bin/curl-old
   `RUNPATH` are rewritten to `$ORIGIN`.
 - `~/.local/bin/<name>` is a symlink to the real binary. Shell rc is never
   edited unless you run `pap add-path`.
+- With `--force-libc`, the Arch `glibc` coupling (libc, libm, loader,
+  `libnss_files/dns/compat`) is vendored like any other dependency and
+  `PT_INTERP` is rewritten to the private loader.
 
 ```
 ~/.local/bin/<name>   →  ~/.pap/exe/<name>/… (on PATH)
@@ -70,7 +86,12 @@ Done. Run: /home/user/.local/bin/curl-old
 ## Limitations
 
 - glibc and the loader stay on the host (VERNEED-checked); every other
-  soname must map to a package that ships it.
+  soname must map to a package that ships it. On hosts older than Arch
+  (e.g. Debian stable) installs default to the newest host-compatible
+  build; only glibc-compatible closures install. `--force-libc` lifts this
+  by vendoring Arch's glibc instead, with caveats: systemd NSS plugins
+  (`libnss_systemd/resolve`) stay on the host, locales fall back to the
+  built-in C.UTF-8, and the host kernel must satisfy the vendored glibc.
 - `dlopen()` is partially covered: plugin dirs under `usr/lib/` are vendored,
   absolute-path `dlopen` is not.
 - GUI stacks are out of scope for now.

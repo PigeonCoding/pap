@@ -20,21 +20,16 @@ import (
 // payload is materialized and installed through the folder machinery, so
 // library isolation, RPATH patching and the manifest work exactly as for
 // folder installs. name defaults to the package name.
+//
+// With default options and no pinned version, the install is glibc-aware:
+// when the live latest needs newer glibc than the host provides, the newest
+// compatible archived build is installed instead (dependencies resolved
+// era-consistently). When even that build's dependency closure turns out too
+// new, older builds are tried automatically, bounded by maxInstallAttempts.
 func InstallRepoApp(pkgName, version, name string, opts InstallOptions) error {
 	if err := Preflight(); err != nil {
 		return err
 	}
-	lh, err := lock.Acquire(config.LockFile)
-	if err != nil {
-		return fmt.Errorf("acquire lock: %w", err)
-	}
-	released := false
-	defer func() {
-		if !released {
-			lh.Release()
-		}
-	}()
-
 	if pkgName == "" {
 		return fmt.Errorf("no package name given (usage: pap install <pkg> [--pkg-version <ver>] [name])")
 	}
@@ -44,55 +39,117 @@ func InstallRepoApp(pkgName, version, name string, opts InstallOptions) error {
 	if err := validName(name); err != nil {
 		return err
 	}
-	if err := prepareInstall(name, opts.Force); err != nil {
-		return err
-	}
 
-	data, info, err := repo.Default().DownloadAppPackage(pkgName, version)
-	if err != nil {
-		return err
-	}
-	if version != "" {
-		opts.printf("Installing %s %s from %s/%s\n", name, info.Version, info.Repo, info.Name)
-	} else {
-		opts.printf("Installing %s %s from %s/%s (live latest)\n", name, info.Version, info.Repo, info.Name)
-	}
+	auto := version == "" && !opts.NoGlibcCompat && !opts.NoArchive && !opts.ForceLibc && allowGlibcCompatSearch()
+	tried := map[string]bool{}
+	const maxInstallAttempts = 4
+	for attempt := 0; ; attempt++ {
+		// Short critical section per attempt: claim the name and prune
+		// stale stages under the cross-process lock. Downloads and the
+		// install itself run unlocked (installDir takes the lock itself);
+		// a concurrent install racing us fails cleanly at the next
+		// prepareInstall instead of clobbering.
+		lh, err := lock.Acquire(config.LockFile)
+		if err != nil {
+			return fmt.Errorf("acquire lock: %w", err)
+		}
+		prepErr := prepareInstall(name, opts.Force)
+		lh.Release()
+		if prepErr != nil {
+			return prepErr
+		}
 
-	work, err := os.MkdirTemp("", "pap-repopkg-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(work)
-	pkgFile := filepath.Join(work, info.Filename)
-	if pkgFile == work || info.Filename == "" {
-		pkgFile = filepath.Join(work, "app.pkg.tar.zst")
-	}
-	if err := os.WriteFile(pkgFile, data, 0644); err != nil {
-		return err
-	}
-	payload := filepath.Join(work, "payload")
-	if err := os.MkdirAll(payload, 0755); err != nil {
-		return err
-	}
-	if out, err := exec.Command("bsdtar", "-xf", pkgFile, "-C", payload).CombinedOutput(); err != nil {
-		return fmt.Errorf("extract %s %s: %w: %s", info.Name, info.Version, err, out)
-	}
+		ver := version
+		if auto && ver == "" {
+			// Automatic glibc-compatible version selection: when the
+			// live latest Arch build needs newer glibc than the host
+			// provides, install the newest archived build the host
+			// can run instead, with dependencies resolved
+			// era-consistently (PreferArchive).
+			if compatVer, ok := autoGlibcVersion(pkgName, opts); ok {
+				ver = compatVer
+				opts.PreferArchive = true
+			}
+		}
 
-	mainRel, err := findRepoMainExe(payload, pkgName, name)
-	if err != nil {
-		return err
+		data, info, err := repo.Default().DownloadAppPackage(pkgName, ver)
+		if err != nil {
+			return err
+		}
+		if ver != "" {
+			opts.printf("Installing %s %s from %s/%s\n", name, info.Version, info.Repo, info.Name)
+		} else {
+			opts.printf("Installing %s %s from %s/%s (live latest)\n", name, info.Version, info.Repo, info.Name)
+		}
+
+		work, err := os.MkdirTemp("", "pap-repopkg-*")
+		if err != nil {
+			return err
+		}
+		pkgFile := filepath.Join(work, info.Filename)
+		if pkgFile == work || info.Filename == "" {
+			pkgFile = filepath.Join(work, "app.pkg.tar.zst")
+		}
+		if werr := os.WriteFile(pkgFile, data, 0644); werr != nil {
+			os.RemoveAll(work)
+			return werr
+		}
+		payload := filepath.Join(work, "payload")
+		if merr := os.MkdirAll(payload, 0755); merr != nil {
+			os.RemoveAll(work)
+			return merr
+		}
+		if out, xerr := exec.Command("bsdtar", "-xf", pkgFile, "-C", payload).CombinedOutput(); xerr != nil {
+			os.RemoveAll(work)
+			return fmt.Errorf("extract %s %s: %w: %s", info.Name, info.Version, xerr, out)
+		}
+
+		mainRel, merr := findRepoMainExe(payload, pkgName, name)
+		if merr != nil {
+			os.RemoveAll(work)
+			return merr
+		}
+		// Route through the folder installer with the entrypoint pinned: the
+		// payload layout (usr/bin/...) is preserved verbatim under exe/<name>/pkg.
+		attemptOpts := opts
+		attemptOpts.Exe = mainRel
+		attemptOpts.ManifestSource = "repo:" + pkgName
+		attemptOpts.ManifestPackage = info.Repo + "/" + info.Name + " " + info.Version
+		ierr := installDir(payload, name, attemptOpts)
+		os.RemoveAll(work)
+		if ierr == nil {
+			return nil
+		}
+		// A dependency closure still too new for the host means the
+		// era-consistent snapshot moved past the host as well: continue
+		// the search with older app builds instead of failing. Anything
+		// else (network, missing deps, pinned versions) returns as-is.
+		// installDir cleans up its uncommitted stages, so retries start
+		// from a clean slate.
+		if !auto || !IsHostGlibcError(ierr) || attempt+1 >= maxInstallAttempts {
+			return ierr
+		}
+		tried[info.Version] = true
+		next, nerr := nextCompatibleVersion(pkgName, tried, opts)
+		if nerr != nil {
+			opts.printf("warning: %v\n", nerr)
+			return ierr
+		}
+		opts.printf("Dependency closure still needs newer glibc than this host provides; trying older build %s %s ...\n", pkgName, next)
+		version = next
+		opts.PreferArchive = true
 	}
-	// Hand the lock to installDir (flock would deadlock if nested): it
-	// re-acquires and re-checks, so a concurrent install of the same name
-	// still fails cleanly instead of clobbering.
-	released = true
-	lh.Release()
-	// Route through the folder installer with the entrypoint pinned: the
-	// payload layout (usr/bin/...) is preserved verbatim under exe/<name>/pkg.
-	opts.Exe = mainRel
-	opts.ManifestSource = "repo:" + pkgName
-	opts.ManifestPackage = info.Repo + "/" + info.Name + " " + info.Version
-	return installDir(payload, name, opts)
+}
+
+// allowGlibcCompatSearch reports whether archive-backed glibc-compatible
+// version selection may run. Under test indexes (httptest Default) archive
+// access would hit the real network, so it is skipped — unless a test
+// explicitly opted in via testArchiveAccess (with ArchiveBaseURL also
+// pointed at httptest, keeping everything hermetic).
+var testArchiveAccess = false
+
+func allowGlibcCompatSearch() bool {
+	return !repo.IsTestOverride() || testArchiveAccess
 }
 
 // findRepoMainExe locates the app binary inside an extracted package payload:

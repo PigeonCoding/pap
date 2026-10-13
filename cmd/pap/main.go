@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"pap/internal/config"
@@ -17,6 +19,22 @@ func main() {
 	}
 
 	cmd := os.Args[1]
+	// Help never parses flags: `pap help [command]`, `pap --help [command]`.
+	if cmd == "help" || cmd == "--help" || cmd == "-h" {
+		topic := ""
+		if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "-") {
+			topic = os.Args[2]
+		}
+		if topic == "" {
+			printUsage(os.Stdout)
+			return
+		}
+		if !printCommandHelp(os.Stdout, topic) {
+			fmt.Fprintf(os.Stderr, "unknown help topic: %s\n", topic)
+			os.Exit(1)
+		}
+		return
+	}
 	args := os.Args[2:]
 
 	force := false
@@ -24,6 +42,9 @@ func main() {
 	quiet := false
 	archiveDate := ""
 	noArchive := false
+	noGlibcCompat := false
+	glibcCompatFlag := false
+	forceLibc := false
 	pkgVersion := ""
 	var pos []string
 	for i := 0; i < len(args); i++ {
@@ -31,8 +52,7 @@ func main() {
 		if a == "--archive-date" {
 			i++
 			if i >= len(args) || strings.HasPrefix(args[i], "-") {
-				fmt.Fprintf(os.Stderr, "--archive-date requires a value: --archive-date YYYY-MM-DD\n")
-				usage()
+				fmt.Fprintf(os.Stderr, "--archive-date requires a value: --archive-date YYYY-MM-DD (run `pap help install`)\n")
 				os.Exit(1)
 			}
 			archiveDate = args[i]
@@ -40,8 +60,7 @@ func main() {
 		}
 		if v, ok := strings.CutPrefix(a, "--archive-date="); ok {
 			if v == "" {
-				fmt.Fprintf(os.Stderr, "--archive-date requires a value: --archive-date YYYY-MM-DD\n")
-				usage()
+				fmt.Fprintf(os.Stderr, "--archive-date requires a value: --archive-date YYYY-MM-DD (run `pap help install`)\n")
 				os.Exit(1)
 			}
 			archiveDate = v
@@ -50,8 +69,7 @@ func main() {
 		if a == "--pkg-version" {
 			i++
 			if i >= len(args) || strings.HasPrefix(args[i], "-") {
-				fmt.Fprintf(os.Stderr, "--pkg-version requires a value: --pkg-version <pkgver>\n")
-				usage()
+				fmt.Fprintf(os.Stderr, "--pkg-version requires a value: --pkg-version <pkgver> (run `pap help install`)\n")
 				os.Exit(1)
 			}
 			pkgVersion = args[i]
@@ -59,8 +77,7 @@ func main() {
 		}
 		if v, ok := strings.CutPrefix(a, "--pkg-version="); ok {
 			if v == "" {
-				fmt.Fprintf(os.Stderr, "--pkg-version requires a value: --pkg-version <pkgver>\n")
-				usage()
+				fmt.Fprintf(os.Stderr, "--pkg-version requires a value: --pkg-version <pkgver> (run `pap help install`)\n")
 				os.Exit(1)
 			}
 			pkgVersion = v
@@ -75,6 +92,18 @@ func main() {
 			quiet = true
 		case "--no-archive":
 			noArchive = true
+		case "--glibc-compat":
+			glibcCompatFlag = true
+		case "--no-glibc-compat":
+			noGlibcCompat = true
+		case "--force-libc":
+			forceLibc = true
+		case "--help", "-h":
+			if !printCommandHelp(os.Stdout, cmd) {
+				fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
+				os.Exit(1)
+			}
+			return
 		case "--add-path":
 			fmt.Fprintf(os.Stderr, "--add-path is a command now: %s add-path\n", os.Args[0])
 			os.Exit(1)
@@ -83,8 +112,7 @@ func main() {
 			return
 		default:
 			if len(a) > 0 && a[0] == '-' {
-				fmt.Fprintf(os.Stderr, "unknown flag: %s\n", a)
-				usage()
+				fmt.Fprintf(os.Stderr, "unknown flag: %s (run `pap help %s`)\n", a, cmd)
 				os.Exit(1)
 			}
 			pos = append(pos, a)
@@ -92,17 +120,24 @@ func main() {
 	}
 	if archiveDate != "" && cmd != "install" && cmd != "upgrade" {
 		fmt.Fprintf(os.Stderr, "--archive-date only applies to install/upgrade (reinstall stays pinned)\n")
-		usage()
+		os.Exit(1)
+	}
+	if glibcCompatFlag && noGlibcCompat {
+		fmt.Fprintf(os.Stderr, "cannot combine --glibc-compat with --no-glibc-compat\n")
+		os.Exit(1)
+	}
+	if (glibcCompatFlag || noGlibcCompat || forceLibc) && cmd != "install" && cmd != "upgrade" {
+		fmt.Fprintf(os.Stderr, "--glibc-compat/--no-glibc-compat/--force-libc only apply to install/upgrade (reinstall carries the manifest setting)\n")
 		os.Exit(1)
 	}
 	opts := func() install.InstallOptions {
-		return install.InstallOptions{Force: force, DryRun: dryRun, Quiet: quiet, ArchiveDate: archiveDate, NoArchive: noArchive}
+		return install.InstallOptions{Force: force, DryRun: dryRun, Quiet: quiet, ArchiveDate: archiveDate, NoArchive: noArchive, NoGlibcCompat: noGlibcCompat, ForceLibc: forceLibc}
 	}
 
 	switch cmd {
 	case "install":
 		if len(pos) < 1 || len(pos) > 2 {
-			fmt.Fprintf(os.Stderr, "usage: %s install [--force] [--dry-run] [--quiet] [--pkg-version <ver>] [--archive-date YYYY-MM-DD] [--no-archive] <pkg> [name]\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "usage: %s install [options] <pkg> [name] (run `pap help install`)\n", os.Args[0])
 			os.Exit(1)
 		}
 		if err := validPkgName(pos[0]); err != nil {
@@ -119,7 +154,7 @@ func main() {
 		}
 	case "reinstall":
 		if len(pos) < 1 {
-			fmt.Fprintf(os.Stderr, "usage: %s reinstall <name>\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "usage: %s reinstall <name> (run `pap help reinstall`)\n", os.Args[0])
 			os.Exit(1)
 		}
 		o := opts()
@@ -129,7 +164,7 @@ func main() {
 		}
 	case "upgrade":
 		if len(pos) < 1 {
-			fmt.Fprintf(os.Stderr, "usage: %s upgrade <name>\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "usage: %s upgrade [options] <name> (run `pap help upgrade`)\n", os.Args[0])
 			os.Exit(1)
 		}
 		o := opts()
@@ -137,9 +172,9 @@ func main() {
 		if err := install.UpgradeWithOptions(pos[0], o); err != nil {
 			fail(err)
 		}
-	case "uninstall":
+	case "remove", "uninstall":
 		if len(pos) < 1 {
-			fmt.Fprintf(os.Stderr, "usage: %s uninstall <name>\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "usage: %s remove <name>\n", os.Args[0])
 			os.Exit(1)
 		}
 		if err := install.Uninstall(pos[0]); err != nil {
@@ -200,24 +235,99 @@ func validPkgName(pkg string) error {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <command> [args...]\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "\ncommands:\n")
-	fmt.Fprintf(os.Stderr, "  install [--force] [--dry-run] [--quiet] [--pkg-version <ver>] [--archive-date YYYY-MM-DD] [--no-archive] <pkg> [name]  Install an app package from the Arch repos with isolated libs\n")
-	fmt.Fprintf(os.Stderr, "      <pkg> is a repo package name; [name] overrides the installed app name.\n")
-	fmt.Fprintf(os.Stderr, "      --pkg-version <ver> pins an exact pkgver, fetched from the Arch Linux\n")
-	fmt.Fprintf(os.Stderr, "        Archive when the mirrors no longer carry it.\n")
-	fmt.Fprintf(os.Stderr, "      --archive-date YYYY-MM-DD resolves missing sonames from the Arch Linux\n")
-	fmt.Fprintf(os.Stderr, "        Archive snapshot of that date instead of latest (default: app binary mtime).\n")
-	fmt.Fprintf(os.Stderr, "      --no-archive disables the Archive fallback (live repos only).\n")
-	fmt.Fprintf(os.Stderr, "  reinstall <name>                     Reinstall from source, pinned to manifest versions\n")
-	fmt.Fprintf(os.Stderr, "  upgrade <name>                       Reinstall from source, re-resolving to current versions\n")
-	fmt.Fprintf(os.Stderr, "  uninstall <name>                     Remove an installed app (only removes binaries we placed)\n")
-	fmt.Fprintf(os.Stderr, "  add-path                             Append the bin dir to your shell rc so it stays on PATH\n")
-	fmt.Fprintf(os.Stderr, "  gc                                   Garbage-collect unused store entries\n")
-	fmt.Fprintf(os.Stderr, "  list                                 List installed apps\n")
-	fmt.Fprintf(os.Stderr, "  info <name>                          Show app manifest, source and pinned versions\n")
-	fmt.Fprintf(os.Stderr, "  doctor                               Check bsdtar/patchelf and state dirs\n")
-	fmt.Fprintf(os.Stderr, "  version                              Print version\n")
-	fmt.Fprintf(os.Stderr, "\nflags (install/reinstall/upgrade): --force/-f, --dry-run/-n, --quiet/-q, --pkg-version, --archive-date, --no-archive\n")
-	fmt.Fprintf(os.Stderr, "env: PAP_HOME overrides ~/.pap (isolation), PAP_BIN_DIR overrides bin dir\n")
+	printUsage(os.Stderr)
+}
+
+// prog is the invoked program name for help screens (argv[0] under
+// `go run` is a long build path nobody wants to read).
+func prog() string {
+	if b := filepath.Base(os.Args[0]); b != "" {
+		return b
+	}
+	return os.Args[0]
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, "usage: %s <command> [options] [args]\n", prog())
+	fmt.Fprintf(w, "\ncommands:\n")
+	fmt.Fprintf(w, "  install <pkg> [name]   Install an Arch repo package with isolated libs\n")
+	fmt.Fprintf(w, "  reinstall <name>       Re-fetch the pinned package version\n")
+	fmt.Fprintf(w, "  upgrade <name>         Re-resolve to the newest compatible version\n")
+	fmt.Fprintf(w, "  remove <name>           Remove an installed app (alias: uninstall)\n")
+	fmt.Fprintf(w, "  list                   List installed apps\n")
+	fmt.Fprintf(w, "  info <name>            Show app manifest, source and pinned versions\n")
+	fmt.Fprintf(w, "  gc                     Garbage-collect unused store entries\n")
+	fmt.Fprintf(w, "  add-path               Append the bin dir to your shell rc\n")
+	fmt.Fprintf(w, "  doctor                 Check tools, dirs and host glibc\n")
+	fmt.Fprintf(w, "  version                Print version\n")
+	fmt.Fprintf(w, "  help [command]         Show help\n")
+	fmt.Fprintf(w, "\noptions (install, upgrade):\n")
+	fmt.Fprintf(w, "  -f, --force            Overwrite an existing install\n")
+	fmt.Fprintf(w, "  -n, --dry-run          Print the resolve plan without changing anything\n")
+	fmt.Fprintf(w, "  -q, --quiet            Suppress progress output\n")
+	fmt.Fprintf(w, "      --pkg-version VER  Pin an exact package version (Archive fallback)\n")
+	fmt.Fprintf(w, "      --archive-date DATE\n")
+	fmt.Fprintf(w, "                         Resolve missing libs from the Archive snapshot of DATE\n")
+	fmt.Fprintf(w, "      --no-archive       Live repos only, no Archive fallback\n")
+	fmt.Fprintf(w, "      --no-glibc-compat  Take live latest even if host glibc is too old\n")
+	fmt.Fprintf(w, "      --force-libc       Vendor Arch glibc + loader, rewrite PT_INTERP\n")
+	fmt.Fprintf(w, "\nrun `%s help <command>` for details.\n", prog())
+	fmt.Fprintf(w, "env: PAP_HOME overrides ~/.pap (isolation), PAP_BIN_DIR overrides bin dir\n")
+}
+
+// printCommandHelp writes detail for one command. It reports false for
+// unknown topics so callers can fail instead of printing blindly.
+func printCommandHelp(w io.Writer, cmd string) bool {
+	switch cmd {
+	case "install":
+		fmt.Fprintf(w, "usage: %s install [options] <pkg> [name]\n", prog())
+		fmt.Fprintf(w, "\nInstall an Arch repo package with isolated libraries.\n")
+		fmt.Fprintf(w, "\n<pkg> is a repo package name; [name] overrides the installed app name.\n")
+		fmt.Fprintf(w, "\nBy default pap installs the newest build your host glibc can run,\n")
+		fmt.Fprintf(w, "auto-downgrading through the Arch Linux Archive on older distros.\n")
+		fmt.Fprintf(w, "\n  --pkg-version VER    Pin an exact version (bypasses glibc auto-selection;\n")
+		fmt.Fprintf(w, "                       fetched from the Archive when mirrors no longer carry it)\n")
+		fmt.Fprintf(w, "  --archive-date DATE  Resolve missing libs from the Archive snapshot of DATE\n")
+		fmt.Fprintf(w, "                       (default: app binary mtime)\n")
+		fmt.Fprintf(w, "  --no-archive         Live repos only\n")
+		fmt.Fprintf(w, "  --no-glibc-compat    Take live latest even if host glibc is too old\n")
+		fmt.Fprintf(w, "  --force-libc         Vendor Arch glibc + loader into the app and rewrite\n")
+		fmt.Fprintf(w, "                       PT_INTERP, so live latest runs even on old distros\n")
+		fmt.Fprintf(w, "  -f, --force          Overwrite an existing install of the same name\n")
+		fmt.Fprintf(w, "  -n, --dry-run        Print the resolve plan without changing anything\n")
+		fmt.Fprintf(w, "  -q, --quiet          Suppress progress output\n")
+	case "upgrade":
+		fmt.Fprintf(w, "usage: %s upgrade [options] <name>\n", prog())
+		fmt.Fprintf(w, "\nReinstall <name> from source, re-resolving to the newest compatible\n")
+		fmt.Fprintf(w, "version. Accepts the same options as install; a --force-libc install\n")
+		fmt.Fprintf(w, "stays vendored unless reinstalled fresh.\n")
+	case "reinstall":
+		fmt.Fprintf(w, "usage: %s reinstall <name>\n", prog())
+		fmt.Fprintf(w, "\nRe-fetch the exact package versions pinned in the manifest.\n")
+		fmt.Fprintf(w, "Stays pinned: glibc/archived-version options do not apply.\n")
+	case "remove", "uninstall":
+		fmt.Fprintf(w, "usage: %s remove <name>\n", prog())
+		fmt.Fprintf(w, "\nRemove an installed app (only removes binaries pap placed).\n")
+	case "info":
+		fmt.Fprintf(w, "usage: %s info <name>\n", prog())
+		fmt.Fprintf(w, "\nShow app manifest, source and pinned versions.\n")
+	case "list":
+		fmt.Fprintf(w, "usage: %s list\n", prog())
+		fmt.Fprintf(w, "\nList installed apps.\n")
+	case "gc":
+		fmt.Fprintf(w, "usage: %s gc\n", prog())
+		fmt.Fprintf(w, "\nGarbage-collect unused store entries.\n")
+	case "add-path":
+		fmt.Fprintf(w, "usage: %s add-path\n", prog())
+		fmt.Fprintf(w, "\nAppend the bin dir to your shell rc so it stays on PATH.\n")
+	case "doctor":
+		fmt.Fprintf(w, "usage: %s doctor\n", prog())
+		fmt.Fprintf(w, "\nCheck bsdtar/patchelf, state dirs and host glibc resolution.\n")
+	case "version":
+		fmt.Fprintf(w, "usage: %s version\n", prog())
+		fmt.Fprintf(w, "\nPrint version.\n")
+	default:
+		return false
+	}
+	return true
 }

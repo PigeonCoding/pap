@@ -2,8 +2,10 @@ package resolver
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"pap/internal/config"
 	"pap/internal/elf"
@@ -45,6 +47,35 @@ func loadersByArch(arch string) []string {
 	default:
 		return []string{"ld-linux.so.2", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1"}
 	}
+}
+
+// LoaderSonames returns the ELF interpreter sonames for arch (usually one).
+// Used by --force-libc to vendor the loader and rewrite PT_INTERP.
+func LoaderSonames(arch string) []string { return loadersByArch(arch) }
+
+// HostGlibcLib reports whether soname belongs to the host glibc/loader
+// coupling (the glibc family plus loaders): libraries that normally stay on
+// the host and are skipped during resolution. --force-libc inverts that for
+// exactly this set, vendoring it from the repos instead.
+func HostGlibcLib(soname string) bool {
+	base := soname
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	for _, l := range loadersByArch(config.Arch) {
+		if base == l {
+			return true
+		}
+	}
+	if base == "ld-linux.so.2" {
+		return true
+	}
+	for _, s := range glibcFamily {
+		if base == s {
+			return true
+		}
+	}
+	return false
 }
 
 // SkipLibs is the process-wide host-provided set. It is rebuilt from
@@ -151,7 +182,7 @@ func loaderPaths() []string {
 	var out []string
 	for _, arch := range []string{config.Arch, "x86_64", "aarch64", "i686"} {
 		for _, l := range loadersByArch(arch) {
-			for _, dir := range []string{"/usr/lib", "/lib", "/usr/lib64", "/lib64"} {
+			for _, dir := range hostSearchDirs() {
 				out = append(out, filepath.Join(dir, l))
 			}
 		}
@@ -160,22 +191,133 @@ func loaderPaths() []string {
 }
 
 func libcPaths() []string {
-	return []string{
-		"/usr/lib/libc.so.6",
-		"/lib/libc.so.6",
-		"/usr/lib64/libc.so.6",
-		"/lib64/libc.so.6",
+	var out []string
+	for _, dir := range hostSearchDirs() {
+		out = append(out, filepath.Join(dir, "libc.so.6"))
 	}
+	return out
 }
 
-func findHostLib(soname string) string {
-	for _, dir := range []string{"/usr/lib", "/lib", "/usr/lib64", "/lib64"} {
-		p := filepath.Join(dir, soname)
-		if _, err := os.Stat(p); err == nil {
+// FindHostLib locates soname on the host. It consults `ldconfig -p` first
+// (authoritative on Debian multiarch, Nix, etc.), then falls back to a
+// directory search covering both Arch (/usr/lib) and Debian
+// (/usr/lib/x86_64-linux-gnu, /lib/x86_64-linux-gnu, ...) layouts.
+// Every candidate is validated (must parse as an ELF for this host's
+// architecture with a matching SONAME); stale ldconfig entries and
+// wrong-architecture copies are skipped, never returned.
+// Returns "" when not found.
+func FindHostLib(soname string) string {
+	if strings.Contains(soname, "/") {
+		if _, err := os.Stat(soname); err == nil {
+			return soname
+		}
+		return ""
+	}
+	cands := []string{ldconfigLibs()[soname]}
+	for _, dir := range hostSearchDirs() {
+		cands = append(cands, filepath.Join(dir, soname))
+	}
+	for _, p := range cands {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if hostCandidateValid(p, soname) {
 			return p
 		}
 	}
 	return ""
+}
+
+// hostCandidateValid reports whether path is usable as the host provider of
+// soname: it must parse as an ELF built for this host (ldconfig can list
+// stale paths and foreign-architecture copies, e.g. i386 libc on x86_64),
+// and its SONAME must match when it declares one.
+func hostCandidateValid(path, soname string) bool {
+	info, err := elf.Parse(path)
+	if err != nil {
+		return false
+	}
+	if err := elf.MachineMismatch(info.Machine, config.Arch); err != nil {
+		return false
+	}
+	if info.SONAME != "" && info.SONAME != soname {
+		return false
+	}
+	return true
+}
+
+func findHostLib(soname string) string {
+	return FindHostLib(soname)
+}
+
+// hostSearchDirs covers Arch (/usr/lib) and Debian multiarch
+// (/usr/lib/<triplet>, /lib/<triplet>) layouts. Globs are expanded once
+// per call; missing dirs simply contribute nothing.
+func hostSearchDirs() []string {
+	base := []string{"/usr/lib", "/lib", "/usr/lib64", "/lib64", "/usr/lib32", "/lib32"}
+	out := append([]string(nil), base...)
+	for _, root := range []string{"/usr/lib", "/lib"} {
+		matches, _ := filepath.Glob(filepath.Join(root, "*-linux-gnu"))
+		out = append(out, matches...)
+	}
+	seen := map[string]bool{}
+	var dedup []string
+	for _, d := range out {
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		dedup = append(dedup, d)
+	}
+	return dedup
+}
+
+var (
+	ldconfigOnce  sync.Once
+	ldconfigCache map[string]string
+)
+
+// ldconfigLibs parses `ldconfig -p` into soname -> path. Empty when ldconfig
+// is missing or fails; callers fall back to directory search. Debian keeps
+// ldconfig in /sbin (off a regular user's PATH), so probe that too.
+func ldconfigLibs() map[string]string {
+	ldconfigOnce.Do(func() {
+		ldconfigCache = map[string]string{}
+		var out []byte
+		var err error
+		for _, bin := range []string{"ldconfig", "/sbin/ldconfig"} {
+			out, err = exec.Command(bin, "-p").Output()
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			return
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			// e.g. "\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6"
+			arrow := strings.Index(line, "=>")
+			if arrow < 0 {
+				continue
+			}
+			left := strings.TrimSpace(line[:arrow])
+			right := strings.TrimSpace(line[arrow+2:])
+			if left == "" || right == "" {
+				continue
+			}
+			soname := strings.Fields(left)[0]
+			if _, err := os.Stat(right); err != nil {
+				continue
+			}
+			if _, ok := ldconfigCache[soname]; !ok {
+				ldconfigCache[soname] = right
+			}
+		}
+	})
+	return ldconfigCache
 }
 
 func Resolve(soname string) (repo.PkgInfo, error) {

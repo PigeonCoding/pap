@@ -27,6 +27,10 @@ type Manifest struct {
 	// inside the exe payload and both absolute-RPATH lib lookup and
 	// exe-relative resource lookup keep working.
 	ExeRel string `json:"exeRel,omitempty"`
+	// ForceLibc records that the app runs against a vendored Arch
+	// glibc/loader (--force-libc) instead of the host's. Reinstall and
+	// upgrade carry it so the app is never silently reverted to host glibc.
+	ForceLibc bool `json:"forceLibc,omitempty"`
 }
 
 func Path(appDir string) string {

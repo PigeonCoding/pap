@@ -19,6 +19,7 @@ import (
 	"pap/internal/elf"
 	"pap/internal/manifest"
 	"pap/internal/repo"
+	"pap/internal/resolver"
 )
 
 func isolate(t *testing.T) string {
@@ -418,7 +419,7 @@ func TestListFolderELFs(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("listFolderELFs = %v, want 2 entries", got)
 	}
-	if got2 := neededFromELFList(nil); len(got2) != 0 {
+	if got2 := neededFromELFList(nil, resolver.Skip); len(got2) != 0 {
 		t.Fatalf("neededFromELFList(nil) = %v", got2)
 	}
 }

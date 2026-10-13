@@ -23,7 +23,7 @@ import (
 )
 
 // Version is the binary version (overridden via ldflags).
-var Version = "0.3"
+var Version = "0.4"
 
 // InstallOptions controls install behavior.
 type InstallOptions struct {
@@ -35,6 +35,22 @@ type InstallOptions struct {
 	Out         io.Writer         // progress output (nil = stdout)
 	ArchiveDate string            // YYYY-MM-DD snapshot for ALA fallback ("" = auto from ELF mtime)
 	NoArchive   bool              // disable the archive.org fallback entirely
+	// NoGlibcCompat disables automatic glibc-compatible version selection
+	// (default on): with it set, install/upgrade take the live latest Arch
+	// build even when the host glibc is too old for it.
+	NoGlibcCompat bool
+	// ForceLibc vendors the Arch glibc/loader coupling (libc, libm, the
+	// dynamic loader, NSS basics) into the app's private libs and rewrites
+	// PT_INTERP to it, instead of running against the host glibc. For old
+	// distros where even archived builds are too new.
+	ForceLibc bool
+	// forceLibcPkg pins the glibc coupling to one package build (set
+	// internally by pickForceLibcPackage, never from the CLI).
+	forceLibcPkg *repo.PkgInfo
+	// PreferArchive resolves dependencies from the dated ALA snapshot first
+	// (falling back to live), keeping the closure era-consistent with an
+	// older app build. Set internally for glibc-compat downgrades.
+	PreferArchive bool
 	// ManifestSource/ManifestPackage override the manifest's source record.
 	// Set by InstallRepoApp so reinstall/upgrade can re-fetch the same
 	// package instead of pointing at a local path.
@@ -65,9 +81,27 @@ func Preflight() error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required tools: %s (install with: sudo pacman -S %s)", strings.Join(missing, ", "), strings.Join(missing, " "))
+		return fmt.Errorf("missing required tools: %s (%s)", strings.Join(missing, ", "), installHint(missing))
 	}
 	return nil
+}
+
+// installHint suggests the right package manager for the host distro:
+// bsdtar lives in libarchive-tools on Debian/Ubuntu, libarchive on Arch.
+func installHint(missing []string) string {
+	if _, err := os.Stat("/etc/debian_version"); err == nil {
+		apt := map[string]string{"bsdtar": "libarchive-tools", "patchelf": "patchelf"}
+		var pkgs []string
+		for _, b := range missing {
+			if p, ok := apt[b]; ok {
+				pkgs = append(pkgs, p)
+			} else {
+				pkgs = append(pkgs, b)
+			}
+		}
+		return "install with: sudo apt-get install -y " + strings.Join(pkgs, " ")
+	}
+	return "install with: sudo pacman -S " + strings.Join(missing, " ")
 }
 
 // Doctor reports environment health (used by `pkg doctor`).
@@ -83,6 +117,35 @@ func Doctor() error {
 	}
 	fmt.Println("doctor: bsdtar + patchelf found, state dirs writable")
 	fmt.Printf("  arch: %s  base: %s  bin: %s\n", config.Arch, config.BaseDir, config.BinDir)
+	if maj, min, p, ok := HostGlibc(); ok {
+		fmt.Printf("  glibc: %s (%s)\n", formatGlibc(maj, min), p)
+	} else {
+		fmt.Println("  glibc: unknown (host libc.so.6 not found)")
+	}
+	if err := checkHostGlibcSanity(); err != nil {
+		fmt.Printf("  glibc check: %v\n", err)
+		return err
+	}
+	return nil
+}
+
+// checkHostGlibcSanity smoke-tests the same host-libc resolution and VERDEF
+// parsing the compat checker relies on: the resolved libc must provide the
+// ancient GLIBC_2.2.5 baseline every distro ships. If it does not, installs
+// would fail with bogus "requires GLIBC_2.2.5" errors, so surface the
+// resolution problem here instead of at install time.
+func checkHostGlibcSanity() error {
+	p := resolver.FindHostLib("libc.so.6")
+	if p == "" {
+		return fmt.Errorf("host libc.so.6 not resolvable (ldconfig + multiarch dirs searched)")
+	}
+	defs, err := elf.ParseVerdef(p)
+	if err != nil {
+		return fmt.Errorf("cannot parse version definitions of %s: %w", p, err)
+	}
+	if !defs["GLIBC_2.2.5"] {
+		return fmt.Errorf("%s provides no GLIBC_2.2.5 (%d version definitions parsed); host resolution picked an unexpected file", p, len(defs))
+	}
 	return nil
 }
 
@@ -145,12 +208,82 @@ func (s *stager) cleanup() {
 
 func (s *stager) commit() { s.committed = true }
 
+// skipLib reports whether soname stays on the host for this install.
+// With ForceLibc the glibc/loader coupling is vendored from the repos like
+// any other dependency, so it is no longer skipped.
+func skipLib(opts InstallOptions, soname string) bool {
+	if opts.ForceLibc && resolver.HostGlibcLib(soname) {
+		return false
+	}
+	return resolver.Skip(soname)
+}
+
+// forceLibcSeeds are sonames that never appear in DT_NEEDED yet must be
+// vendored for a self-sufficient glibc: the dynamic loader (requested via
+// PT_INTERP, not NEEDED) and the NSS plugins glibc dlopens per
+// /etc/nsswitch.conf (libnss_files for passwd/group/shadow/hosts,
+// libnss_dns for DNS, libnss_compat for compat-mode entries).
+func forceLibcSeeds() []string {
+	seeds := append([]string(nil), resolver.LoaderSonames(config.Arch)...)
+	seeds = append(seeds, "libnss_files.so.2", "libnss_dns.so.2", "libnss_compat.so.2")
+	return seeds
+}
+
+// pickForceLibcPackage chooses the single glibc build to vendor under
+// --force-libc: the official core/glibc when indexed, else whatever provides
+// libc.so.6. Never a patched variant (e.g. chaotic's glibc-eac), which wins
+// provider priority by declaring %PROVIDES% while core/glibc relies on the
+// files index — and never a mix: every coupling soname must come from one
+// build or the loader loads a Frankenstein libc.
+func pickForceLibcPackage() (repo.PkgInfo, error) {
+	if pkgs := repo.Default().FindPackage("glibc"); len(pkgs) > 0 {
+		return pkgs[0], nil
+	}
+	if provs := repo.Default().Providers("libc.so.6"); len(provs) > 0 {
+		return provs[0], nil
+	}
+	return repo.PkgInfo{}, fmt.Errorf("no package provides libc.so.6")
+}
+
+// pinProviders restricts providers to the pinned package build, falling
+// back to the full list when the pin carries none of them.
+func pinProviders(providers []repo.PkgInfo, pin *repo.PkgInfo) []repo.PkgInfo {
+	if pin == nil {
+		return providers
+	}
+	var kept []repo.PkgInfo
+	for _, p := range providers {
+		if p.Repo == pin.Repo && p.Name == pin.Name {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) > 0 {
+		return kept
+	}
+	return providers
+}
+
+// forceLibcPinSoname reports whether soname must come from the pinned glibc
+// build: the loader/libc coupling plus the seeded NSS plugins.
+func forceLibcPinSoname(soname string) bool {
+	if resolver.HostGlibcLib(soname) {
+		return true
+	}
+	base := soname
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	return strings.HasPrefix(base, "libnss_")
+}
+
 // checkELFHost validates an ELF against the host (arch + interpreter).
-func checkELFHost(abs string, info *elf.LibInfo) error {
+// With ForceLibc the interpreter is replaced by the vendored loader, so its
+// presence on the host is not required.
+func checkELFHost(abs string, info *elf.LibInfo, forceLibc bool) error {
 	if err := elf.MachineMismatch(info.Machine, config.Arch); err != nil {
 		return err
 	}
-	if info.Interp != "" {
+	if info.Interp != "" && !forceLibc {
 		if _, err := os.Stat(info.Interp); err != nil {
 			return fmt.Errorf("interpreter %s not found on host (unsupported binary, e.g. musl)", info.Interp)
 		}
@@ -223,7 +356,7 @@ func installDir(absDir, name string, opts InstallOptions) error {
 		if err != nil {
 			return err
 		}
-		if err := checkELFHost(absMain, info); err != nil {
+		if err := checkELFHost(absMain, info, opts.ForceLibc); err != nil {
 			return err
 		}
 	}
@@ -238,6 +371,16 @@ func installDir(absDir, name string, opts InstallOptions) error {
 
 	if err := repo.Default().Load(); err != nil {
 		return fmt.Errorf("load repo index: %w", err)
+	}
+	if opts.ForceLibc {
+		pin, err := pickForceLibcPackage()
+		if err != nil {
+			return err
+		}
+		if pin.Repo != "core" || pin.Name != "glibc" {
+			opts.printf("  note: glibc coupling pinned to %s/%s %s\n", pin.Repo, pin.Name, pin.Version)
+		}
+		opts.forceLibcPkg = &pin
 	}
 
 	// Every ELF in the folder contributes its DT_NEEDED: the main binary
@@ -261,7 +404,7 @@ func installDir(absDir, name string, opts InstallOptions) error {
 			skippedForeign = append(skippedForeign, rel)
 			continue
 		}
-		if err := checkELFHost(p, fi); err != nil {
+		if err := checkELFHost(p, fi, opts.ForceLibc); err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
 		keptELFs = append(keptELFs, p)
@@ -271,15 +414,21 @@ func installDir(absDir, name string, opts InstallOptions) error {
 	for _, rel := range skippedForeign {
 		skipSet[rel] = true
 	}
+	skip := func(soname string) bool { return skipLib(opts, soname) }
 	var toResolve []string
 	if info != nil {
 		for _, lib := range info.NEEDED {
-			if !resolver.Skip(lib) {
+			if !skip(lib) {
 				toResolve = append(toResolve, lib)
 			}
 		}
 	}
-	toResolve = append(toResolve, neededFromELFList(folderELFs)...)
+	toResolve = append(toResolve, neededFromELFList(folderELFs, skip)...)
+	if opts.ForceLibc {
+		// The loader (PT_INTERP, never in NEEDED) and the NSS plugins
+		// glibc dlopens must be vendored explicitly.
+		toResolve = append(toResolve, forceLibcSeeds()...)
+	}
 
 	// Installed exe: exe/<name>/pkg/<mainRel>. External resource trees
 	// (outside the folder) are mapped against its directory; trees already
@@ -301,7 +450,7 @@ func installDir(absDir, name string, opts InstallOptions) error {
 		opts.printf("App resources: %s -> %s\n", rd.host, filepath.Join("exe", name, dest))
 		staged = append(staged, stagedRes{host: rd.host, rel: dest})
 		extHosts = append(extHosts, rd.host)
-		toResolve = append(toResolve, neededFromTree(rd.host)...)
+		toResolve = append(toResolve, neededFromTree(rd.host, skip)...)
 	}
 	// The folder payload itself is authoritative for the sonames it ships.
 	localRoots := append([]string{absDir}, extHosts...)
@@ -384,6 +533,12 @@ func installDir(absDir, name string, opts InstallOptions) error {
 		}
 	}
 
+	if opts.ForceLibc {
+		if err := patchInterps(stagedELFs, stagedMain, libsDir, libsAbs, opts); err != nil {
+			return err
+		}
+	}
+
 	for _, sr := range staged {
 		opts.printf("Vendoring resources %s...\n", sr.host)
 		if err := copyTree(sr.host, filepath.Join(stageExe, sr.rel)); err != nil {
@@ -406,6 +561,7 @@ func installDir(absDir, name string, opts InstallOptions) error {
 		SourceSHA256: srcHash,
 		PlacedBinary: true,
 		ExeRel:       exeRel,
+		ForceLibc:    opts.ForceLibc,
 	}
 	if err := manifest.Save(stageApp, m); err != nil {
 		return err
@@ -700,6 +856,10 @@ type archiveScope struct {
 	// real network — skip those, but honor explicit dates (tests for the
 	// archive path itself set one).
 	explicit bool
+	// preferArchive resolves from the snapshot first (live as fallback),
+	// keeping the closure era-consistent with a downgraded app build.
+	// Set for glibc-compat downgrades.
+	preferArchive bool
 }
 
 func newArchiveScope(roots []string, opts InstallOptions) *archiveScope {
@@ -722,38 +882,61 @@ func newArchiveScope(roots []string, opts InstallOptions) *archiveScope {
 	// which duplicates the live index — still useful as a fallback source
 	// for sonames the live mirrors already pruned.
 	s.enabled, s.date = true, repo.ArchiveDateFromRoots(roots)
+	s.preferArchive = opts.PreferArchive && opts.Locked == nil
 	return s
+}
+
+// archiveProviders resolves soname against the dated snapshot, loading it
+// once. Empty when disabled, unavailable, or (under test indexes) skipped.
+func (s *archiveScope) archiveProviders(soname string) ([]repo.PkgInfo, *repo.Index, string) {
+	if !s.enabled {
+		return nil, nil, ""
+	}
+	// When tests override Default with an httptest index, ArchiveIndex would
+	// hit the real network — skip it unless an explicit --archive-date opts
+	// in (unit tests below cover archive.go directly against httptest) or a
+	// test explicitly allowed hermetic archive access (ArchiveBaseURL
+	// pointed at httptest for glibc-compat tests).
+	if repo.IsTestOverride() && !s.explicit && !testArchiveAccess && s.used == "" && s.idx == nil {
+		return nil, nil, ""
+	}
+	if s.idx == nil && s.used == "" {
+		idx, used, err := repo.ArchiveIndex(s.date)
+		if err != nil {
+			return nil, nil, ""
+		}
+		s.idx, s.used = idx, used
+	}
+	if s.idx == nil {
+		return nil, nil, ""
+	}
+	arch := s.idx.Providers(soname)
+	if len(arch) == 0 {
+		return nil, nil, ""
+	}
+	return arch, s.idx, s.used
 }
 
 // providersFor returns the live providers when non-empty, else the archived
 // snapshot's providers (loading the snapshot once). The returned index is the
 // one to download from so package bytes match the resolving snapshot.
+// With preferArchive (glibc-compat downgrades) the snapshot wins so the
+// closure stays era-consistent with the older app build.
 func (s *archiveScope) providersFor(soname string) ([]repo.PkgInfo, *repo.Index, string) {
+	if s.preferArchive {
+		if arch, idx, snap := s.archiveProviders(soname); len(arch) > 0 {
+			return arch, idx, snap
+		}
+		return repo.Default().Providers(soname), nil, ""
+	}
 	live := repo.Default().Providers(soname)
 	if len(live) > 0 || !s.enabled {
 		return live, nil, ""
 	}
-	// When tests override Default with an httptest index, ArchiveIndex would
-	// hit the real network — skip it unless an explicit --archive-date opts
-	// in (unit tests below cover archive.go directly against httptest).
-	if repo.IsTestOverride() && !s.explicit && s.used == "" && s.idx == nil {
-		return live, nil, ""
+	if arch, idx, snap := s.archiveProviders(soname); len(arch) > 0 {
+		return arch, idx, snap
 	}
-	if s.idx == nil && s.used == "" {
-		idx, used, err := repo.ArchiveIndex(s.date)
-		if err != nil {
-			return live, nil, ""
-		}
-		s.idx, s.used = idx, used
-	}
-	if s.idx == nil {
-		return live, nil, ""
-	}
-	arch := s.idx.Providers(soname)
-	if len(arch) == 0 {
-		return live, nil, ""
-	}
-	return arch, s.idx, s.used
+	return live, nil, ""
 }
 
 // resolveAndStage BFS-resolves sonames, downloading packages in parallel
@@ -806,6 +989,11 @@ func resolveAndStage(roots []string, toResolve []string, libsDir string, local m
 		provFresh := make([]bool, len(frontier))
 		for i, soname := range frontier {
 			providers, srcIdx, snap := arch.providersFor(soname)
+			// --force-libc keeps the loader/libc/NSS coupling inside one
+			// glibc build instead of spreading it across providers.
+			if opts.ForceLibc && forceLibcPinSoname(soname) {
+				providers = pinProviders(providers, opts.forceLibcPkg)
+			}
 			// Version lock: when none of the providers are in the locked
 			// set, the soname is a dependency the manifest never pinned
 			// (e.g. newly discovered via resource-tree scan on reinstall)
@@ -963,7 +1151,7 @@ func resolveAndStage(roots []string, toResolve []string, libsDir string, local m
 			depInfo, err := elf.Parse(filepath.Join(libsDir, soname))
 			if err == nil {
 				for _, n := range depInfo.NEEDED {
-					if !resolver.Skip(n) && !seen[n] {
+					if !skipLib(opts, n) && !seen[n] {
 						queue = append(queue, n)
 					}
 				}
@@ -1023,7 +1211,8 @@ func resolveStageCompat(roots []string, toResolve []string, libsDir string, loca
 			return nil, nil, nil, err
 		}
 		opts.printf("\nChecking dependency compatibility...\n")
-		problems := checkCompatDetailed(roots, libsDir)
+		skip := func(soname string) bool { return skipLib(opts, soname) }
+		problems := checkCompatDetailed(roots, libsDir, skip)
 		if len(problems) == 0 {
 			return dedup(installed), dedup(private), usedPkgs, nil
 		}
@@ -1049,7 +1238,11 @@ func resolveStageCompat(roots []string, toResolve []string, libsDir string, loca
 			for i, pr := range problems {
 				msgs[i] = pr.Error()
 			}
-			return nil, nil, nil, fmt.Errorf("dependency compatibility:\n  %s", strings.Join(msgs, "\n  "))
+			msg := fmt.Sprintf("dependency compatibility:\n  %s", strings.Join(msgs, "\n  "))
+			if hostTooOld(problems, libsDir) {
+				msg += "\n" + hostTooOldHint(opts.NoGlibcCompat)
+			}
+			return nil, nil, nil, fmt.Errorf("%s", msg)
 		}
 		for _, s := range heal {
 			forced[s] = true
@@ -1121,6 +1314,9 @@ func dryRun(roots []string, toResolve []string, local map[string]string, opts In
 			continue
 		}
 		providers, _, snap := arch.providersFor(soname)
+		if opts.ForceLibc && forceLibcPinSoname(soname) {
+			providers = pinProviders(providers, opts.forceLibcPkg)
+		}
 		if len(providers) == 0 {
 			opts.printf("  [fail] %s: no package provides %s\n", soname, soname)
 			continue
@@ -1171,6 +1367,8 @@ func ReinstallWithOptions(name string, opts InstallOptions) error {
 	if !pok {
 		return fmt.Errorf("%s: manifest has a repo source but no pinned package version; use install instead", name)
 	}
+	// A vendored-libc app must stay vendored across reinstalls.
+	opts.ForceLibc = opts.ForceLibc || m.ForceLibc
 	return InstallRepoApp(pkg, version, name, opts)
 }
 
@@ -1189,6 +1387,8 @@ func UpgradeWithOptions(name string, opts InstallOptions) error {
 	}
 	opts.Force = true
 	opts.Locked = nil
+	// A vendored-libc app stays vendored across upgrades.
+	opts.ForceLibc = opts.ForceLibc || m.ForceLibc
 	// Re-resolve to the live latest.
 	return InstallRepoApp(pkg, "", name, opts)
 }
@@ -1439,15 +1639,16 @@ func isNameChar(b byte) bool {
 		b == '_' || b == '-' || b == '.' || b == '+'
 }
 
-// neededFromFile collects a single ELF's DT_NEEDED (non-host) entries.
-func neededFromFile(path string) []string {
+// neededFromFile collects a single ELF's DT_NEEDED entries, excluding the
+// host-provided ones per skip.
+func neededFromFile(path string, skip func(string) bool) []string {
 	info, err := elf.Parse(path)
 	if err != nil {
 		return nil
 	}
 	var out []string
 	for _, n := range info.NEEDED {
-		if !resolver.Skip(n) {
+		if !skip(n) {
 			out = append(out, n)
 		}
 	}
@@ -1537,15 +1738,15 @@ func listFolderELFs(root string) []string {
 	return out
 }
 
-// neededFromELFList collects DT_NEEDED (non-host) entries from an explicit
+// neededFromELFList collects DT_NEEDED entries from an explicit
 // ELF list, deduplicated. Unlike neededFromTree it does not filter by
 // filename: folder payloads may ship executables without ".so" or "bin/"
 // in their names.
-func neededFromELFList(paths []string) []string {
+func neededFromELFList(paths []string, skip func(string) bool) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, p := range paths {
-		for _, n := range neededFromFile(p) {
+		for _, n := range neededFromFile(p, skip) {
 			if !seen[n] {
 				seen[n] = true
 				out = append(out, n)
@@ -1553,6 +1754,49 @@ func neededFromELFList(paths []string) []string {
 		}
 	}
 	return out
+}
+
+// patchInterps rewrites PT_INTERP of every staged executable to the vendored
+// loader (--force-libc): without it the host loader would load the vendored
+// libc, mixing two glibc builds. Shared objects carry no INTERP and are
+// skipped, as are static binaries and scripts. The ".real" candidate covers
+// the wrapper fallback, where patchBinaryRPATH renames the ELF aside.
+func patchInterps(stagedELFs []string, stagedMain, stageLibsDir, libsAbs string, opts InstallOptions) error {
+	loaders := resolver.LoaderSonames(config.Arch)
+	if len(loaders) == 0 {
+		return fmt.Errorf("no loader soname for arch %s", config.Arch)
+	}
+	if _, err := os.Stat(filepath.Join(stageLibsDir, loaders[0])); err != nil {
+		return fmt.Errorf("vendored loader %s missing from staged libs: %w", loaders[0], err)
+	}
+	interp := filepath.Join(libsAbs, loaders[0])
+	opts.printf("Patching INTERP to vendored loader %s...\n", loaders[0])
+	seen := map[string]bool{}
+	cands := append(append([]string(nil), stagedELFs...), stagedMain, stagedMain+".real")
+	for _, p := range cands {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		info, err := elf.Parse(p)
+		if err != nil || info.Interp == "" || info.Interp == interp {
+			continue
+		}
+		if err := patchelfInterp(p, interp); err != nil {
+			return fmt.Errorf("patchelf --set-interpreter %s: %w", relTo(filepath.Dir(stagedMain), p), err)
+		}
+	}
+	return nil
+}
+
+func patchelfInterp(binary, interp string) error {
+	cmd := exec.Command("patchelf", "--set-interpreter", interp, binary)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // patchFolderELF rewrites one bundled ELF's RPATH to the app's libs dir,
@@ -1599,7 +1843,7 @@ func relTo(root, path string) string {
 // neededFromTree collects DT_NEEDED entries of ELF objects under a host
 // resource tree (e.g. kitty's python extensions), so their own dependencies
 // join the BFS and get vendored too.
-func neededFromTree(root string) []string {
+func neededFromTree(root string, skip func(string) bool) []string {
 	seen := map[string]bool{}
 	var out []string
 	count := 0
@@ -1619,7 +1863,7 @@ func neededFromTree(root string) []string {
 			return nil
 		}
 		for _, n := range info.NEEDED {
-			if !resolver.Skip(n) && !seen[n] {
+			if !skip(n) && !seen[n] {
 				seen[n] = true
 				out = append(out, n)
 			}
@@ -1895,6 +2139,9 @@ func Info(name string) error {
 		fmt.Printf("binary:  %s\n", filepath.Join(config.BinDir, m.Binary))
 	}
 	fmt.Printf("source:  %s\n", m.Source)
+	if m.ForceLibc {
+		fmt.Printf("libc:    vendored (--force-libc)\n")
+	}
 	if m.SourceSHA256 != "" {
 		fmt.Printf("src-sha: %.12s\n", m.SourceSHA256)
 	}
@@ -1947,10 +2194,14 @@ func extractLibsFromFile(pkg repo.PkgInfo, pkgFile, soname, libsDir string) (nam
 	extract.Stdout = &extractOut
 	extract.Stderr = &extractOut
 	if err := extract.Run(); err != nil {
+		// bsdtar reports "delayed" errors (e.g. hard links pointing outside
+		// the extracted usr/lib subset, as in Arch's glibc package) via
+		// its exit status while still extracting everything else: warn and
+		// continue. A genuinely broken package fails below when its soname
+		// is missing from the tree.
 		if s := strings.TrimSpace(extractOut.String()); s != "" {
 			fmt.Printf("  [warn] bsdtar %s: %s\n", pkg.Name, s)
 		}
-		return nil, nil, fmt.Errorf("extract: %w", err)
 	}
 
 	libDir := filepath.Join(tmpDir, "usr", "lib")
