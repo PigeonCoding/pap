@@ -31,6 +31,10 @@ type Manifest struct {
 	// glibc/loader (--force-libc) instead of the host's. Reinstall and
 	// upgrade carry it so the app is never silently reverted to host glibc.
 	ForceLibc bool `json:"forceLibc,omitempty"`
+	// Helpers pins helper executables vendored from other repo packages
+	// ("repo/name" -> version), e.g. electron35 for vesktop. Reinstall
+	// re-fetches these exact versions; upgrade re-resolves them fresh.
+	Helpers map[string]string `json:"helpers,omitempty"`
 }
 
 func Path(appDir string) string {

@@ -42,14 +42,16 @@ type Index struct {
 	mu          sync.RWMutex
 	loadMu      sync.Mutex
 	fileMap     map[string][]PkgInfo
-	pkgMeta     map[string]PkgInfo // "repo/name" -> package index metadata
+	pkgMeta     map[string]PkgInfo   // "repo/name" -> package index metadata
+	binMap      map[string][]PkgInfo // basename under usr/bin|usr/sbin -> packages
 	repos       []repoDef
 	cacheDir    string
 	pkgCacheDir string
 	loaded      bool
 
 	// File indexes (<repo>.files) are fetched on demand: they are large and
-	// only needed for sonames no %PROVIDES% entry claims.
+	// only needed for sonames no %PROVIDES% entry claims (or helper binaries
+	// no package declares).
 	filesMu     sync.Mutex
 	filesLoaded bool
 }
@@ -111,6 +113,7 @@ func NewWithRepos(repos []repoDef, cacheDir, pkgCacheDir string) *Index {
 	return &Index{
 		fileMap:     make(map[string][]PkgInfo),
 		pkgMeta:     make(map[string]PkgInfo),
+		binMap:      make(map[string][]PkgInfo),
 		repos:       repos,
 		cacheDir:    cacheDir,
 		pkgCacheDir: pkgCacheDir,
@@ -459,6 +462,7 @@ func (idx *Index) fetchIndex(def repoDef, kind string) error {
 	if kind == "files" {
 		servers = idx.orderedServers(def)
 	}
+	fmt.Fprintf(os.Stderr, "Fetching %s...\n", filepath.Base(file))
 
 	var lastErr error
 	for _, srv := range servers {
@@ -682,12 +686,23 @@ func looksLikeSoname(s string) bool {
 	return i > 0 && i+4 <= len(s) && s[i+4] >= '0' && s[i+4] <= '9'
 }
 
-// loadFileIndex fetches each repo's files index — the file list pacman keeps
-// alongside the package index — and maps every shared object under usr/lib to
-// the package shipping it. It runs on first use only: sonames such as
-// libpython3.14.so.1.0 are not covered by any %PROVIDES% entry, but the file
-// they live in still has to be found.
+// loadFileIndex ensures the repo file indexes are loaded: the file list
+// pacman keeps alongside the package index. It runs on first use only:
+// sonames such as libpython3.14.so.1.0 are not covered by any %PROVIDES%
+// entry, but the file they live in still has to be found.
 func (idx *Index) loadFileIndex(soname string) {
+	idx.ensureFileIndex(fmt.Sprintf(
+		"  note: %s is not declared in package metadata; loading repo file indexes (downloaded once, then cached)\n", soname))
+}
+
+// loadBinIndex is the executable counterpart: helper binaries no package
+// declares (the files index is keyed by path, not metadata).
+func (idx *Index) loadBinIndex(name string) {
+	idx.ensureFileIndex(fmt.Sprintf(
+		"  note: %s is provided by no indexed package; loading repo file indexes (downloaded once, then cached)\n", name))
+}
+
+func (idx *Index) ensureFileIndex(note string) {
 	if err := idx.Load(); err != nil {
 		return
 	}
@@ -698,11 +713,11 @@ func (idx *Index) loadFileIndex(soname string) {
 	}
 	idx.filesLoaded = true
 
-	fmt.Fprintf(os.Stderr, "  note: %s is not declared in package metadata; loading repo file indexes (downloaded once, then cached)\n", soname)
+	fmt.Fprintf(os.Stderr, "%s", note)
 
 	type result struct {
-		bySoname map[string][]PkgInfo
-		err      error
+		entries fileEntries
+		err     error
 	}
 	res := make([]result, len(idx.repos))
 	var wg sync.WaitGroup
@@ -715,13 +730,16 @@ func (idx *Index) loadFileIndex(soname string) {
 				res[i].err = err
 				return
 			}
-			res[i].bySoname, res[i].err = parseFilesIndex(def.name, idx.indexFile(def.name, "files"))
+			res[i].entries, res[i].err = parseFilesIndex(def.name, idx.indexFile(def.name, "files"))
 		}(i)
 	}
 	wg.Wait()
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	if idx.binMap == nil {
+		idx.binMap = make(map[string][]PkgInfo)
+	}
 	for i, r := range res {
 		if r.err != nil {
 			fmt.Fprintf(os.Stderr, "warning: repo %s: file index: %v\n", idx.repos[i].name, r.err)
@@ -729,7 +747,7 @@ func (idx *Index) loadFileIndex(soname string) {
 		}
 		// Merged in repo order, appended after the %PROVIDES% entries, so
 		// declared providers keep priority and resolution stays deterministic.
-		for sn, pkgs := range r.bySoname {
+		for sn, pkgs := range r.entries.sonames {
 			for _, p := range pkgs {
 				// Prefer the package index's copy of the metadata: the file
 				// list can be from an older snapshot than the package index.
@@ -741,7 +759,24 @@ func (idx *Index) loadFileIndex(soname string) {
 				}
 			}
 		}
+		for bn, pkgs := range r.entries.bins {
+			for _, p := range pkgs {
+				if cur, ok := idx.pkgMeta[p.Repo+"/"+p.Name]; ok {
+					p = cur
+				}
+				if !hasProvider(idx.binMap[bn], p) {
+					idx.binMap[bn] = append(idx.binMap[bn], p)
+				}
+			}
+		}
 	}
+}
+
+// fileEntries is one repo's parsed files index: shared-object basenames
+// under usr/lib plus executable basenames under usr/bin and usr/sbin.
+type fileEntries struct {
+	sonames map[string][]PkgInfo
+	bins    map[string][]PkgInfo
 }
 
 func hasProvider(list []PkgInfo, p PkgInfo) bool {
@@ -753,33 +788,34 @@ func hasProvider(list []PkgInfo, p PkgInfo) bool {
 	return false
 }
 
-// parseFilesIndex maps sonames to the packages shipping them, keyed by the
-// shared-object basenames under usr/lib.
-func parseFilesIndex(repoName, dbFile string) (map[string][]PkgInfo, error) {
+// parseFilesIndex maps file basenames to the packages shipping them: shared
+// objects under usr/lib (keyed for soname lookup) and executables directly
+// under usr/bin or usr/sbin (keyed for helper-binary lookup).
+func parseFilesIndex(repoName, dbFile string) (fileEntries, error) {
 	switch dbKind(dbFile) {
 	case "gzip":
 		return parseFilesGzipDb(repoName, dbFile)
 	case "zstd":
 		return parseFilesZstdDb(repoName, dbFile)
 	default:
-		return nil, fmt.Errorf("unknown db compression in %s", dbFile)
+		return fileEntries{}, fmt.Errorf("unknown db compression in %s", dbFile)
 	}
 }
 
-func parseFilesGzipDb(repoName, dbFile string) (map[string][]PkgInfo, error) {
+func parseFilesGzipDb(repoName, dbFile string) (fileEntries, error) {
 	f, err := os.Open(dbFile)
 	if err != nil {
-		return nil, err
+		return fileEntries{}, err
 	}
 	defer f.Close()
 
 	gr, err := gzip.NewReader(f)
 	if err != nil {
-		return nil, err
+		return fileEntries{}, err
 	}
 	defer gr.Close()
 
-	out := map[string][]PkgInfo{}
+	out := fileEntries{sonames: map[string][]PkgInfo{}, bins: map[string][]PkgInfo{}}
 	tr := tar.NewReader(gr)
 	var (
 		cur    PkgInfo
@@ -792,7 +828,7 @@ func parseFilesGzipDb(repoName, dbFile string) (map[string][]PkgInfo, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return fileEntries{}, err
 		}
 		if strings.HasSuffix(hdr.Name, "/") {
 			continue
@@ -816,20 +852,21 @@ func parseFilesGzipDb(repoName, dbFile string) (map[string][]PkgInfo, error) {
 			if err != nil {
 				continue
 			}
-			addLibFiles(out, cur, string(data))
+			addLibFiles(out.sonames, cur, string(data))
+			addBinFiles(out.bins, cur, string(data))
 		}
 	}
 	return out, nil
 }
 
-func parseFilesZstdDb(repoName, dbFile string) (map[string][]PkgInfo, error) {
+func parseFilesZstdDb(repoName, dbFile string) (fileEntries, error) {
 	tmp, err := extractTo(dbFile, "repofiles-*")
 	if err != nil {
-		return nil, err
+		return fileEntries{}, err
 	}
 	defer os.RemoveAll(tmp)
 
-	out := map[string][]PkgInfo{}
+	out := fileEntries{sonames: map[string][]PkgInfo{}, bins: map[string][]PkgInfo{}}
 	err = filepath.Walk(tmp, func(p string, info os.FileInfo, werr error) error {
 		if werr != nil || info.IsDir() || filepath.Base(p) != "desc" {
 			return nil
@@ -843,7 +880,8 @@ func parseFilesZstdDb(repoName, dbFile string) (map[string][]PkgInfo, error) {
 			return nil
 		}
 		if filesData, err := os.ReadFile(filepath.Join(filepath.Dir(p), "files")); err == nil {
-			addLibFiles(out, pkg, string(filesData))
+			addLibFiles(out.sonames, pkg, string(filesData))
+			addBinFiles(out.bins, pkg, string(filesData))
 		}
 		return nil
 	})
@@ -877,6 +915,28 @@ func addLibFiles(out map[string][]PkgInfo, pkg PkgInfo, files string) {
 	}
 }
 
+// addBinFiles indexes executables pkg ships directly in usr/bin or usr/sbin,
+// keyed by basename — what a helper-binary reference in a launcher script
+// names. Anything nested deeper (private helpers) is the owning package's
+// own business, resolved through its resource dirs instead.
+func addBinFiles(out map[string][]PkgInfo, pkg PkgInfo, files string) {
+	for _, prefix := range []string{"usr/bin/", "usr/sbin/"} {
+		for _, line := range strings.Split(files, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, prefix) {
+				continue
+			}
+			base := strings.TrimPrefix(line, prefix)
+			if base == "" || strings.Contains(base, "/") {
+				continue // directory entry or nested file
+			}
+			if !hasProvider(out[base], pkg) {
+				out[base] = append(out[base], pkg)
+			}
+		}
+	}
+}
+
 // Resolve returns the highest-priority provider for soname: the first
 // %PROVIDES% match in pacman.conf order, falling back to the file indexes.
 func (idx *Index) Resolve(soname string) (PkgInfo, error) {
@@ -902,6 +962,26 @@ func (idx *Index) lookup(soname string) []PkgInfo {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return append([]PkgInfo(nil), idx.fileMap[soname]...)
+}
+
+// ProvidersForBin returns every package shipping an executable basename
+// directly under usr/bin or usr/sbin, in priority order. It loads the repo
+// file indexes on first use, like the soname fallback.
+func (idx *Index) ProvidersForBin(name string) []PkgInfo {
+	if strings.Contains(name, "/") {
+		return nil
+	}
+	if out := idx.lookupBin(name); len(out) > 0 {
+		return out
+	}
+	idx.loadBinIndex(name)
+	return idx.lookupBin(name)
+}
+
+func (idx *Index) lookupBin(name string) []PkgInfo {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return append([]PkgInfo(nil), idx.binMap[name]...)
 }
 
 func (idx *Index) defFor(repoName string) (repoDef, bool) {

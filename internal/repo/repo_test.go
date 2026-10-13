@@ -53,6 +53,7 @@ func testIndex(t *testing.T, dbEntries, fileEntries []tarEntry) *Index {
 	return &Index{
 		fileMap:  make(map[string][]PkgInfo),
 		pkgMeta:  make(map[string]PkgInfo),
+		binMap:   make(map[string][]PkgInfo),
 		repos:    []repoDef{{name: "core", servers: []string{"http://127.0.0.1:0"}}},
 		cacheDir: cacheDir,
 	}
@@ -290,5 +291,40 @@ func TestOrderedServersDropsStalePin(t *testing.T) {
 	}
 	if got := idx.orderedServers(def); !slices.Equal(got, def.servers) {
 		t.Errorf("current pin: orderedServers = %v, want %v", got, def.servers)
+	}
+}
+
+// The files index also maps executables directly under usr/bin and usr/sbin
+// (helper binaries no package declares), without disturbing soname lookup.
+func TestProvidersForBinFromFileIndex(t *testing.T) {
+	idx := testIndex(t,
+		[]tarEntry{
+			{"helper-1.0-1/desc", desc("helper", "1.0-1", "")},
+		},
+		[]tarEntry{
+			{"helper-1.0-1/desc", desc("helper", "1.0-1", "")},
+			{"helper-1.0-1/files", "%FILES%\nusr/\nusr/bin/\nusr/bin/ehelper\n" +
+				"usr/sbin/\nusr/sbin/ehelper-admin\n" +
+				"usr/lib/\nusr/lib/ehelper/\nusr/lib/ehelper/libpriv.so.1\n" +
+				"usr/share/\nusr/share/doc/\nusr/share/doc/helper/readme\n"},
+		},
+	)
+	if err := idx.Load(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"ehelper", "ehelper-admin"} {
+		provs := idx.ProvidersForBin(name)
+		if len(provs) != 1 || provs[0].Name != "helper" {
+			t.Fatalf("ProvidersForBin(%q) = %+v, want [helper]", name, provs)
+		}
+	}
+	// Nested files and docs are not providers; path input is rejected.
+	for _, name := range []string{"libpriv.so.1", "readme", "usr/bin/ehelper", "", "nope"} {
+		if provs := idx.ProvidersForBin(name); len(provs) != 0 {
+			t.Fatalf("ProvidersForBin(%q) = %+v, want none", name, provs)
+		}
+	}
+	if !idx.filesLoaded {
+		t.Error("file index not loaded for a bin lookup")
 	}
 }

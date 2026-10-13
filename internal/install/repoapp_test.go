@@ -74,7 +74,7 @@ func buildRepoE2E(t *testing.T, work, appName, builtVer, advertisedVer string) (
 		d := "%FILENAME%\n" + fn + "\n\n%NAME%\n" + pkgname + "\n\n%VERSION%\n" + pkgver +
 			"\n\n%ARCH%\n" + config.Arch + "\n\n%SHA256SUM%\n" + sha + "\n"
 		return pkgFile, d
-	};
+	}
 
 	appPkg, _ := mkpkg(appName, builtVer, "", "", "usr/bin/"+appName)
 	libPkg, libDesc := mkpkg("e2elib", "1.0-1", lib, "usr/lib/libe2e.so.1", "")
@@ -348,7 +348,7 @@ func TestGlibcCompatClosureRetryE2E(t *testing.T) {
 		}
 		data, _ = os.ReadFile(pkgFile)
 		return data, pkgname + "-" + pkgver + "-" + config.Arch + ".pkg.tar"
-	};
+	}
 	descFor := func(pkgname, pkgver, fn string, data []byte, provides string) string {
 		h := sha256.Sum256(data)
 		d := "%FILENAME%\n" + fn + "\n\n%NAME%\n" + pkgname + "\n\n%VERSION%\n" + pkgver +
@@ -448,12 +448,12 @@ func TestForceLibcE2E(t *testing.T) {
 	// Fixture glibc package: real host files (valid ELFs with proper
 	// SONAMEs and version definitions), declared via %PROVIDES%.
 	hostLibs := map[string]string{
-		"libc.so.6":             "/usr/lib/libc.so.6",
-		"libm.so.6":             "/usr/lib/libm.so.6",
-		"ld-linux-x86-64.so.2":  "/usr/lib/ld-linux-x86-64.so.2",
-		"libnss_files.so.2":     "/usr/lib/libnss_files.so.2",
-		"libnss_dns.so.2":       "/usr/lib/libnss_dns.so.2",
-		"libnss_compat.so.2":    "/usr/lib/libnss_compat.so.2",
+		"libc.so.6":            "/usr/lib/libc.so.6",
+		"libm.so.6":            "/usr/lib/libm.so.6",
+		"ld-linux-x86-64.so.2": "/usr/lib/ld-linux-x86-64.so.2",
+		"libnss_files.so.2":    "/usr/lib/libnss_files.so.2",
+		"libnss_dns.so.2":      "/usr/lib/libnss_dns.so.2",
+		"libnss_compat.so.2":   "/usr/lib/libnss_compat.so.2",
 	}
 	if config.Arch != "x86_64" {
 		t.Skip("fixture loader name is x86_64-specific")
@@ -524,7 +524,7 @@ func TestForceLibcE2E(t *testing.T) {
 		}
 		data, _ = os.ReadFile(pkgFile)
 		return data, pkgname + "-" + pkgver + "-" + config.Arch + ".pkg.tar"
-	};
+	}
 	descFor := func(pkgname, pkgver, fn string, data []byte, provides string) string {
 		h := sha256.Sum256(data)
 		d := "%FILENAME%\n" + fn + "\n\n%NAME%\n" + pkgname + "\n\n%VERSION%\n" + pkgver +
@@ -586,5 +586,176 @@ func TestForceLibcE2E(t *testing.T) {
 		t.Fatal("expected exit code 42, got 0")
 	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 42 {
 		t.Fatalf("vendored-libc run = %v, want exit 42", err)
+	}
+}
+
+// TestHelperExecutablesE2E covers launcher scripts that exec helper binaries
+// by bare name plus absolute resource paths: the helper package is resolved
+// via the files index, its binaries/resources/needed-libs are vendored, the
+// script's absolute refs are rewritten to the payload, and the BinDir entry
+// becomes a PATH-prepending launcher.
+func TestHelperExecutablesE2E(t *testing.T) {
+	for _, bin := range []string{"gcc", "bsdtar", "patchelf"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s unavailable", bin)
+		}
+	}
+	home := isolate(t)
+	work := t.TempDir()
+
+	// Shared dep lib (exit code source).
+	os.WriteFile(filepath.Join(work, "e2e.c"), []byte("int e2e_fn(void){return 42;}\n"), 0644)
+	cmd := exec.Command("gcc", "-shared", "-fPIC", "-Wl,-soname,libe2e.so.1",
+		"-o", filepath.Join(work, "libe2e.so.1.0"), filepath.Join(work, "e2e.c"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("gcc lib: %v %s", err, out)
+	}
+	libBytes, _ := os.ReadFile(filepath.Join(work, "libe2e.so.1.0"))
+
+	// Second dep lib, needed only by the helper's private resource plugin.
+	os.WriteFile(filepath.Join(work, "e2extra.c"), []byte("int e2extra_fn(void){return 1;}\n"), 0644)
+	cmd = exec.Command("gcc", "-shared", "-fPIC", "-Wl,-soname,libe2extra.so.1",
+		"-o", filepath.Join(work, "libe2extra.so.1.0"), filepath.Join(work, "e2extra.c"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("gcc extra lib: %v %s", err, out)
+	}
+	extraBytes, _ := os.ReadFile(filepath.Join(work, "libe2extra.so.1.0"))
+	os.WriteFile(filepath.Join(work, "plug.c"), []byte("extern int e2extra_fn(void); int plug_fn(void){return e2extra_fn();}\n"), 0644)
+	cmd = exec.Command("gcc", "-shared", "-fPIC", "-Wl,-soname,libplug.so.1",
+		"-o", filepath.Join(work, "plug.so"), filepath.Join(work, "plug.c"),
+		"-L"+work, "-l:libe2extra.so.1.0", "-Wl,-rpath,"+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("gcc resource plugin: %v %s", err, out)
+	}
+	plugBytes, _ := os.ReadFile(filepath.Join(work, "plug.so"))
+
+	// Helper binary: ordinary ELF linked against the dep lib.
+	os.WriteFile(filepath.Join(work, "helper.c"), []byte("extern int e2e_fn(void); int main(void){return e2e_fn();}\n"), 0644)
+	cmd = exec.Command("gcc", "-o", filepath.Join(work, "ehelper"), filepath.Join(work, "helper.c"),
+		"-L"+work, "-l:libe2e.so.1.0", "-Wl,-rpath,"+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("gcc helper: %v %s", err, out)
+	}
+	helperBytes, _ := os.ReadFile(filepath.Join(work, "ehelper"))
+
+	mkpkg := func(pkgname, pkgver string, files map[string][]byte) (data []byte, fn string) {
+		staging := filepath.Join(work, "pkgroot-"+pkgname+"-"+pkgver)
+		for rel, b := range files {
+			p := filepath.Join(staging, rel)
+			os.MkdirAll(filepath.Dir(p), 0755)
+			mode := os.FileMode(0644)
+			if strings.HasPrefix(rel, "usr/bin/") {
+				mode = 0755
+			}
+			os.WriteFile(p, b, mode)
+		}
+		os.WriteFile(filepath.Join(staging, ".PKGINFO"),
+			[]byte("pkgname = "+pkgname+"\npkgver = "+pkgver+"\narch = "+config.Arch+"\n"), 0644)
+		var members []string
+		for rel := range files {
+			members = append(members, rel)
+		}
+		members = append(members, ".PKGINFO")
+		pkgFile := filepath.Join(work, pkgname+"-"+pkgver+"-"+config.Arch+".pkg.tar")
+		args := append([]string{"-cf", pkgFile, "-C", staging}, members...)
+		if out, err := exec.Command("bsdtar", args...).CombinedOutput(); err != nil {
+			t.Fatalf("bsdtar pkg %s: %v %s", pkgname, err, out)
+		}
+		data, _ = os.ReadFile(pkgFile)
+		return data, pkgname + "-" + pkgver + "-" + config.Arch + ".pkg.tar"
+	}
+	descFor := func(pkgname, pkgver, fn string, data []byte, provides string) string {
+		h := sha256.Sum256(data)
+		d := "%FILENAME%\n" + fn + "\n\n%NAME%\n" + pkgname + "\n\n%VERSION%\n" + pkgver +
+			"\n\n%ARCH%\n" + config.Arch + "\n\n%SHA256SUM%\n" + hex.EncodeToString(h[:]) + "\n"
+		if provides != "" {
+			d += "\n%PROVIDES%\n" + provides + "\n"
+		}
+		return d
+	}
+
+	appScript := "#!/bin/sh\nexec ehelper /usr/lib/e2eapp/data.txt \"$@\"\n"
+	appData, appFn := mkpkg("e2eapp", "1.0-1", map[string][]byte{
+		"usr/bin/e2eapp":          []byte(appScript),
+		"usr/lib/e2eapp/data.txt": []byte("payload-data"),
+	})
+	libData, libFn := mkpkg("e2elib", "1.0-1", map[string][]byte{"usr/lib/libe2e.so.1": libBytes})
+	helpData, helpFn := mkpkg("e2ehelp", "1.0-1", map[string][]byte{
+		"usr/bin/ehelper":         helperBytes,
+		"usr/lib/e2ehelp/res.txt": []byte("helper-resources"),
+		"usr/lib/e2ehelp/plug.so": plugBytes,
+	})
+	extraData, extraFn := mkpkg("e2eextra", "1.0-1", map[string][]byte{"usr/lib/libe2extra.so.1": extraBytes})
+	dbBytes := gzipTar([]tarEntry{
+		{"e2eapp-1.0-1/desc", descFor("e2eapp", "1.0-1", appFn, appData, "")},
+		{"e2elib-1.0-1/desc", descFor("e2elib", "1.0-1", libFn, libData, "libe2e.so=1-64")},
+		{"e2ehelp-1.0-1/desc", descFor("e2ehelp", "1.0-1", helpFn, helpData, "")},
+		{"e2eextra-1.0-1/desc", descFor("e2eextra", "1.0-1", extraFn, extraData, "libe2extra.so=1-64")},
+	})
+	filesBytes := gzipTar([]tarEntry{
+		{"e2ehelp-1.0-1/desc", "%NAME%\ne2ehelp\n\n%VERSION%\n1.0-1\n\n%ARCH%\n" + config.Arch + "\n"},
+		{"e2ehelp-1.0-1/files", "%FILES%\nusr/\nusr/bin/\nusr/bin/ehelper\nusr/lib/\nusr/lib/e2ehelp/\nusr/lib/e2ehelp/res.txt\n"},
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/core.db", func(w http.ResponseWriter, r *http.Request) { w.Write(dbBytes) })
+	mux.HandleFunc("/core.files", func(w http.ResponseWriter, r *http.Request) { w.Write(filesBytes) })
+	mux.HandleFunc("/"+appFn, func(w http.ResponseWriter, r *http.Request) { w.Write(appData) })
+	mux.HandleFunc("/"+libFn, func(w http.ResponseWriter, r *http.Request) { w.Write(libData) })
+	mux.HandleFunc("/"+helpFn, func(w http.ResponseWriter, r *http.Request) { w.Write(helpData) })
+	mux.HandleFunc("/"+extraFn, func(w http.ResponseWriter, r *http.Request) { w.Write(extraData) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	idx := repo.NewTestRepo("core", srv.URL, filepath.Join(home, "cache", "repo"), filepath.Join(home, "pkgcache"))
+	repo.OverrideDefault(idx)
+
+	var out strings.Builder
+	if err := InstallRepoApp("e2eapp", "", "e2ehelpered", InstallOptions{Out: &out}); err != nil {
+		t.Fatalf("InstallRepoApp with helpers: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "[helper] ehelper -> core/e2ehelp 1.0-1") {
+		t.Fatalf("no helper vendoring note in output:\n%s", out.String())
+	}
+	m, err := manifest.Load(filepath.Join(home, "apps", "e2ehelpered"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Helpers["core/e2ehelp"] != "1.0-1" {
+		t.Fatalf("manifest Helpers = %v, want core/e2ehelp 1.0-1", m.Helpers)
+	}
+	// Helper binary and its resources landed in the payload.
+	for _, rel := range []string{"usr/bin/ehelper", "usr/lib/e2ehelp/res.txt"} {
+		if _, err := os.Stat(filepath.Join(home, "exe", "e2ehelpered", "pkg", rel)); err != nil {
+			t.Fatalf("payload %s missing: %v", rel, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, "apps", "e2ehelpered", "libs", "libe2e.so.1")); err != nil {
+		t.Fatalf("helper dep lib missing: %v", err)
+	}
+	// The helper resource plugin's own dependency joined resolution too.
+	if _, err := os.Stat(filepath.Join(home, "apps", "e2ehelpered", "libs", "libe2extra.so.1")); err != nil {
+		t.Fatalf("helper resource dep lib missing: %v", err)
+	}
+	// Absolute resource ref rewritten to the payload.
+	stagedScript, _ := os.ReadFile(filepath.Join(home, "exe", "e2ehelpered", "pkg", "usr", "bin", "e2eapp"))
+	if !strings.Contains(string(stagedScript), filepath.Join(home, "exe", "e2ehelpered", "pkg", "usr", "lib", "e2eapp", "data.txt")) {
+		t.Fatalf("absolute ref not rewritten to payload:\n%s", stagedScript)
+	}
+	if strings.Contains(string(stagedScript), "ehelper /usr/lib/") {
+		t.Fatalf("absolute host ref survived:\n%s", stagedScript)
+	}
+	// BinDir entry is a PATH-prepending launcher (script main already was).
+	launcher, err := os.ReadFile(filepath.Join(home, "bin", "e2ehelpered"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(launcher), "export PATH=") || !strings.Contains(string(launcher), "pkg/usr/bin") {
+		t.Fatalf("launcher lacks payload PATH:\n%s", launcher)
+	}
+	// End to end: launcher -> script -> vendored helper -> vendored dep lib.
+	if err := exec.Command(filepath.Join(home, "bin", "e2ehelpered")).Run(); err == nil {
+		t.Fatal("expected exit code 42, got 0")
+	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 42 {
+		t.Fatalf("helper run = %v, want exit 42", err)
 	}
 }

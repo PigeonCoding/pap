@@ -7,9 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"pap/internal/config"
 	"pap/internal/elf"
-	"pap/internal/lock"
 	"pap/internal/repo"
 )
 
@@ -49,7 +47,7 @@ func InstallRepoApp(pkgName, version, name string, opts InstallOptions) error {
 		// install itself run unlocked (installDir takes the lock itself);
 		// a concurrent install racing us fails cleanly at the next
 		// prepareInstall instead of clobbering.
-		lh, err := lock.Acquire(config.LockFile)
+		lh, err := acquireLock()
 		if err != nil {
 			return fmt.Errorf("acquire lock: %w", err)
 		}
@@ -72,14 +70,19 @@ func InstallRepoApp(pkgName, version, name string, opts InstallOptions) error {
 			}
 		}
 
+		if ver != "" {
+			opts.printf("Downloading %s %s...\n", pkgName, ver)
+		} else {
+			opts.printf("Downloading %s (live latest)...\n", pkgName)
+		}
 		data, info, err := repo.Default().DownloadAppPackage(pkgName, ver)
 		if err != nil {
 			return err
 		}
 		if ver != "" {
-			opts.printf("Installing %s %s from %s/%s\n", name, info.Version, info.Repo, info.Name)
+			opts.printf("Installing %s %s from %s/%s (%s)\n", name, info.Version, info.Repo, info.Name, formatBytes(len(data)))
 		} else {
-			opts.printf("Installing %s %s from %s/%s (live latest)\n", name, info.Version, info.Repo, info.Name)
+			opts.printf("Installing %s %s from %s/%s (live latest, %s)\n", name, info.Version, info.Repo, info.Name, formatBytes(len(data)))
 		}
 
 		work, err := os.MkdirTemp("", "pap-repopkg-*")
@@ -99,6 +102,7 @@ func InstallRepoApp(pkgName, version, name string, opts InstallOptions) error {
 			os.RemoveAll(work)
 			return merr
 		}
+		opts.printf("Extracting package...\n")
 		if out, xerr := exec.Command("bsdtar", "-xf", pkgFile, "-C", payload).CombinedOutput(); xerr != nil {
 			os.RemoveAll(work)
 			return fmt.Errorf("extract %s %s: %w: %s", info.Name, info.Version, xerr, out)

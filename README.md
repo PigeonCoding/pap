@@ -75,6 +75,10 @@ Done. Run: /home/user/.local/bin/curl-old
 - With `--force-libc`, the Arch `glibc` coupling (libc, libm, loader,
   `libnss_files/dns/compat`) is vendored like any other dependency and
   `PT_INTERP` is rewritten to the private loader.
+- Launcher scripts' helper executables (`exec electron …`) are resolved via
+  the file index and vendored with their resources; absolute `/usr/…` refs
+  in scripts are rewritten to the payload, and the BinDir entry becomes a
+  `PATH`-prepending launcher.
 
 ```
 ~/.local/bin/<name>   →  ~/.pap/exe/<name>/… (on PATH)

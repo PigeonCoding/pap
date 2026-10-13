@@ -51,6 +51,10 @@ type InstallOptions struct {
 	// (falling back to live), keeping the closure era-consistent with an
 	// older app build. Set internally for glibc-compat downgrades.
 	PreferArchive bool
+	// HelperLocked pins helper executables vendored from other repo packages
+	// ("repo/name" -> version). Set from the manifest on reinstall so
+	// helpers stay at their recorded versions.
+	HelperLocked map[string]string
 	// ManifestSource/ManifestPackage override the manifest's source record.
 	// Set by InstallRepoApp so reinstall/upgrade can re-fetch the same
 	// package instead of pointing at a local path.
@@ -102,6 +106,32 @@ func installHint(missing []string) string {
 		return "install with: sudo apt-get install -y " + strings.Join(pkgs, " ")
 	}
 	return "install with: sudo pacman -S " + strings.Join(missing, " ")
+}
+
+// acquireLock takes the cross-process lock, warning after a few seconds so
+// a second invocation blocked behind a running one doesn't look hung.
+func acquireLock() (*lock.Hold, error) {
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-time.After(3 * time.Second):
+			fmt.Fprintf(os.Stderr, "Waiting for another pap process to release the lock...\n")
+		case <-done:
+		}
+	}()
+	return lock.Acquire(config.LockFile)
+}
+
+// formatBytes renders a download size for progress lines.
+func formatBytes(n int) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	if n < 1024*1024 {
+		return fmt.Sprintf("%.0f KiB", float64(n)/1024)
+	}
+	return fmt.Sprintf("%.1f MiB", float64(n)/(1024*1024))
 }
 
 // Doctor reports environment health (used by `pkg doctor`).
@@ -321,7 +351,7 @@ func installDir(absDir, name string, opts InstallOptions) error {
 	if err := Preflight(); err != nil {
 		return err
 	}
-	lh, err := lock.Acquire(config.LockFile)
+	lh, err := acquireLock()
 	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
@@ -456,11 +486,27 @@ func installDir(absDir, name string, opts InstallOptions) error {
 	localRoots := append([]string{absDir}, extHosts...)
 	local := buildLocalLibs(append(localRoots, originLibDirs(absMain)...))
 
+	// Helper executables referenced by launcher scripts resolve against
+	// the same era snapshot as libraries (the snapshot loads lazily and is
+	// shared process-wide per date).
+	hscope := newArchiveScope([]string{absMain}, opts)
+
 	if opts.DryRun {
 		opts.printf("Dry run: would copy folder %s to exe/%s/pkg/\n", absDir, name)
 		opts.printf("Dry run: would patch %d bundled ELF(s)\n", len(folderELFs))
 		if len(staged) > 0 {
 			opts.printf("Dry run: would vendor %d resource dir(s)\n", len(staged))
+		}
+		for _, p := range planHelpers(absDir, hscope, opts) {
+			ver := p.ver
+			extra := ""
+			if p.pinned {
+				extra = " (pinned)"
+			} else if p.snap != "" {
+				extra = " [archive " + p.snap + "]"
+			}
+			opts.printf("  [helper] %s -> %s/%s %s%s\n",
+				strings.Join(p.names, ","), p.pkg.Repo, p.pkg.Name, ver, extra)
 		}
 		return dryRun([]string{absMain}, toResolve, local, opts)
 	}
@@ -476,6 +522,19 @@ func installDir(absDir, name string, opts InstallOptions) error {
 	if err := copyTree(absDir, filepath.Join(stageExe, "pkg")); err != nil {
 		return fmt.Errorf("copy folder: %w", err)
 	}
+	stagedRoot := filepath.Join(stageExe, "pkg")
+
+	// Vendor helper executables referenced by launcher scripts (and their
+	// resources) before library resolution, so their DT_NEEDED joins the
+	// BFS and their files land in the staged tree that gets patched.
+	helperRes, err := vendorHelpers(stagedRoot, hscope, local, opts)
+	if err != nil {
+		return err
+	}
+	toResolve = append(toResolve, helperRes.needed...)
+	if err := rewriteStagedRefs(stagedRoot, name, opts); err != nil {
+		return err
+	}
 
 	libsDir := filepath.Join(stageApp, "libs")
 	if err := os.MkdirAll(libsDir, 0755); err != nil {
@@ -486,7 +545,8 @@ func installDir(absDir, name string, opts InstallOptions) error {
 	// from the private libs dir — not just the main entrypoint. A script
 	// main is left alone (no RPATH to patch); its ELF children still go local.
 	// Foreign-arch helpers skipped during resolution are skipped here too.
-	stagedRoot := filepath.Join(stageExe, "pkg")
+	// (stagedRoot was defined above; helper executables vendored into it
+	// are included in this walk.)
 	var stagedELFs []string
 	for _, p := range listFolderELFs(stagedRoot) {
 		if skipSet[relTo(stagedRoot, p)] {
@@ -499,6 +559,9 @@ func installDir(absDir, name string, opts InstallOptions) error {
 	installedLibs, _, usedPkgs, err := resolveStageCompat(stagedELFs, toResolve, libsDir, local, opts)
 	if err != nil {
 		return err
+	}
+	for k, v := range helperRes.used {
+		usedPkgs[k] = v
 	}
 
 	libsAbs := filepath.Join(config.AppsDir, name, "libs")
@@ -562,12 +625,25 @@ func installDir(absDir, name string, opts InstallOptions) error {
 		PlacedBinary: true,
 		ExeRel:       exeRel,
 		ForceLibc:    opts.ForceLibc,
+		Helpers:      helperRes.pins,
 	}
 	if err := manifest.Save(stageApp, m); err != nil {
 		return err
 	}
 
-	return finishInstall(stg, name, m.ExeRel, opts)
+	// Helper executables live under the payload bin dirs; expose them to
+	// the entrypoint (and anything it spawns) via PATH in the launcher.
+	// Without helpers the BinDir entry keeps its exact previous form.
+	var helperPathDirs []string
+	if len(helperRes.pins) > 0 {
+		for _, cls := range []string{"bin", "sbin"} {
+			if st, err := os.Stat(filepath.Join(stagedRoot, "usr", cls)); err == nil && st.IsDir() {
+				helperPathDirs = append(helperPathDirs, filepath.Join(config.ExeDir, name, "pkg", "usr", cls))
+			}
+		}
+	}
+
+	return finishInstall(stg, name, m.ExeRel, opts, helperPathDirs)
 }
 
 // resolveMainExe finds the folder's main executable (ELF or shebang script).
@@ -812,7 +888,7 @@ func stageLocalLib(soname, src, libsDir string) (names, private []string, err er
 
 // finishInstall atomically publishes both stage dirs and links the binary
 // into BinDir. On any failure the previous install is restored.
-func finishInstall(stg *stager, name, exeRel string, opts InstallOptions) error {
+func finishInstall(stg *stager, name, exeRel string, opts InstallOptions, helperPathDirs []string) error {
 	target := filepath.Join(config.ExeDir, name, exeRel)
 	if err := publishAll(stg.app, stg.exe, name, opts.Force); err != nil {
 		return err
@@ -826,7 +902,7 @@ func finishInstall(stg *stager, name, exeRel string, opts InstallOptions) error 
 		}
 	}()
 
-	if err := placeSymlink(target, name, opts.Force); err != nil {
+	if err := placeSymlink(target, name, opts.Force, helperPathDirs); err != nil {
 		return err
 	}
 	commitAppDirs(name)
@@ -886,11 +962,12 @@ func newArchiveScope(roots []string, opts InstallOptions) *archiveScope {
 	return s
 }
 
-// archiveProviders resolves soname against the dated snapshot, loading it
-// once. Empty when disabled, unavailable, or (under test indexes) skipped.
-func (s *archiveScope) archiveProviders(soname string) ([]repo.PkgInfo, *repo.Index, string) {
+// ensureSnapshot loads the dated snapshot index once. It reports false
+// when disabled, unavailable, or (under test indexes) skipped to avoid
+// real-network access.
+func (s *archiveScope) ensureSnapshot() bool {
 	if !s.enabled {
-		return nil, nil, ""
+		return false
 	}
 	// When tests override Default with an httptest index, ArchiveIndex would
 	// hit the real network — skip it unless an explicit --archive-date opts
@@ -898,19 +975,38 @@ func (s *archiveScope) archiveProviders(soname string) ([]repo.PkgInfo, *repo.In
 	// test explicitly allowed hermetic archive access (ArchiveBaseURL
 	// pointed at httptest for glibc-compat tests).
 	if repo.IsTestOverride() && !s.explicit && !testArchiveAccess && s.used == "" && s.idx == nil {
-		return nil, nil, ""
+		return false
 	}
 	if s.idx == nil && s.used == "" {
 		idx, used, err := repo.ArchiveIndex(s.date)
 		if err != nil {
-			return nil, nil, ""
+			return false
 		}
 		s.idx, s.used = idx, used
 	}
-	if s.idx == nil {
+	return s.idx != nil
+}
+
+// archiveProviders resolves soname against the dated snapshot, loading it
+// once. Empty when disabled, unavailable, or (under test indexes) skipped.
+func (s *archiveScope) archiveProviders(soname string) ([]repo.PkgInfo, *repo.Index, string) {
+	if !s.ensureSnapshot() {
 		return nil, nil, ""
 	}
 	arch := s.idx.Providers(soname)
+	if len(arch) == 0 {
+		return nil, nil, ""
+	}
+	return arch, s.idx, s.used
+}
+
+// archiveBinProviders is the helper-executable counterpart: packages shipping
+// basename under usr/bin or usr/sbin in the dated snapshot.
+func (s *archiveScope) archiveBinProviders(name string) ([]repo.PkgInfo, *repo.Index, string) {
+	if !s.ensureSnapshot() {
+		return nil, nil, ""
+	}
+	arch := s.idx.ProvidersForBin(name)
 	if len(arch) == 0 {
 		return nil, nil, ""
 	}
@@ -988,6 +1084,18 @@ func resolveAndStage(roots []string, toResolve []string, libsDir string, local m
 		provSnap := make([]string, len(frontier))
 		provFresh := make([]bool, len(frontier))
 		for i, soname := range frontier {
+			// Already on disk (bundled, or co-shipped private lib aliased
+			// to top-level by extractLibs): nothing to prefetch and no
+			// index lookup — the stage loop below reuses the file and
+			// only queues its own deps.
+			if _, ok := local[soname]; ok {
+				provLists[i] = nil
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(libsDir, soname)); err == nil {
+				provLists[i] = nil
+				continue
+			}
 			providers, srcIdx, snap := arch.providersFor(soname)
 			// --force-libc keeps the loader/libc/NSS coupling inside one
 			// glibc build instead of spreading it across providers.
@@ -1019,9 +1127,6 @@ func resolveAndStage(roots []string, toResolve []string, libsDir string, local m
 			provLists[i] = providers
 			provIdx[i] = srcIdx
 			provSnap[i] = snap
-			if _, ok := local[soname]; ok {
-				continue // staged from disk below; nothing to prefetch
-			}
 			if len(providers) == 0 {
 				continue
 			}
@@ -1052,6 +1157,17 @@ func resolveAndStage(roots []string, toResolve []string, libsDir string, local m
 					localStaged[soname] = true
 				} else {
 					opts.printf("  [warn] %s: bundled copy unusable (%v); trying repo\n", soname, lerr)
+				}
+			}
+			// Co-shipped private libs arrive as a side effect of their
+			// parent's extraction (extractLibs aliases subdir objects like
+			// pulseaudio/libpulsecommon-17.0.so to top-level): already on
+			// disk, no provider lookup needed — just queue their own deps
+			// via the common tail below.
+			if !staged {
+				if _, err := os.Stat(filepath.Join(libsDir, soname)); err == nil {
+					opts.printf("  [ok] %s -> already staged (co-shipped private lib)\n", soname)
+					staged = true
 				}
 			}
 			if !staged {
@@ -1268,6 +1384,11 @@ func parallelDownload(tasks []dlTask, cache map[string][]byte, mu *sync.Mutex, o
 	if len(tasks) == 0 {
 		return
 	}
+	if len(tasks) == 1 {
+		opts.printf("Downloading 1 package...\n")
+	} else {
+		opts.printf("Downloading %d packages...\n", len(tasks))
+	}
 	const workers = 8
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
@@ -1292,6 +1413,7 @@ func parallelDownload(tasks []dlTask, cache map[string][]byte, mu *sync.Mutex, o
 			if err != nil {
 				return // sequential pass reports the error
 			}
+			opts.printf("  [dl] %s (%s)\n", t.key, formatBytes(len(data)))
 			mu.Lock()
 			if _, ok := cache[t.key]; !ok {
 				cache[t.key] = data
@@ -1369,6 +1491,9 @@ func ReinstallWithOptions(name string, opts InstallOptions) error {
 	}
 	// A vendored-libc app must stay vendored across reinstalls.
 	opts.ForceLibc = opts.ForceLibc || m.ForceLibc
+	if opts.HelperLocked == nil {
+		opts.HelperLocked = m.Helpers
+	}
 	return InstallRepoApp(pkg, version, name, opts)
 }
 
@@ -1944,7 +2069,11 @@ func copyTree(src, dst string) error {
 // $(dirname $0) would look next to the symlink instead of the payload.
 // Scripts get a tiny launcher that execs the real path, making $0 resolve
 // to the payload (sibling ELFs are already patched, so the script stays local).
-func placeSymlink(targetAbs, name string, force bool) error {
+//
+// Vendored helper executables force the launcher form too (even for ELF
+// entrypoints): the launcher prepends the payload bin dirs to PATH so bare
+// names resolve inside the payload.
+func placeSymlink(targetAbs, name string, force bool, helperPathDirs []string) error {
 	if err := os.MkdirAll(config.BinDir, 0755); err != nil {
 		return err
 	}
@@ -1961,8 +2090,12 @@ func placeSymlink(targetAbs, name string, force bool) error {
 			return fmt.Errorf("backup %s: %w", dest, err)
 		}
 	}
-	if elf.IsScript(targetAbs) && !elf.IsELF(targetAbs) {
-		return placeScriptLauncher(targetAbs, dest, name)
+	// Helper executables change the entrypoint contract: children spawned by
+	// bare name must resolve inside the payload, so the BinDir entry becomes
+	// a PATH-prepending launcher even for ELF binaries (argv[0] then names
+	// the payload binary instead of the symlink).
+	if len(helperPathDirs) > 0 || (elf.IsScript(targetAbs) && !elf.IsELF(targetAbs)) {
+		return placeScriptLauncher(targetAbs, dest, name, helperPathDirs)
 	}
 	tmp, err := os.CreateTemp(config.BinDir, ".link-*")
 	if err != nil {
@@ -1987,9 +2120,17 @@ func placeSymlink(targetAbs, name string, force bool) error {
 // placeScriptLauncher installs a BinDir entry for a script entrypoint: a
 // small executable that execs the real script by absolute path. The inner
 // script then sees $0 under ~/.pap/exe/<name>/, so $(dirname $0)-relative
-// helper lookups land in the payload instead of the BinDir.
-func placeScriptLauncher(targetAbs, dest, name string) error {
-	body := "#!/bin/sh\nexec \"" + targetAbs + "\" \"$@\"\n"
+// helper lookups land in the payload instead of the BinDir. When helper
+// executables were vendored, PATH gains the payload bin dirs first so bare
+// names (e.g. `exec electron35`) resolve inside the payload.
+func placeScriptLauncher(targetAbs, dest, name string, helperPathDirs []string) error {
+	var sb strings.Builder
+	sb.WriteString("#!/bin/sh\n")
+	if len(helperPathDirs) > 0 {
+		sb.WriteString("export PATH=\"" + strings.Join(helperPathDirs, ":") + "${PATH:+:$PATH}\"\n")
+	}
+	sb.WriteString("exec \"" + targetAbs + "\" \"$@\"\n")
+	body := sb.String()
 	tmp, err := os.CreateTemp(config.BinDir, ".launcher-*")
 	if err != nil {
 		rollbackPlacedBinary(name)
@@ -2017,7 +2158,7 @@ func placeScriptLauncher(targetAbs, dest, name string) error {
 }
 
 func Uninstall(name string) error {
-	lh, err := lock.Acquire(config.LockFile)
+	lh, err := acquireLock()
 	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
@@ -2142,6 +2283,12 @@ func Info(name string) error {
 	if m.ForceLibc {
 		fmt.Printf("libc:    vendored (--force-libc)\n")
 	}
+	if len(m.Helpers) > 0 {
+		fmt.Printf("helpers: %d vendored\n", len(m.Helpers))
+		for k, v := range m.Helpers {
+			fmt.Printf("  %s %s\n", k, v)
+		}
+	}
 	if m.SourceSHA256 != "" {
 		fmt.Printf("src-sha: %.12s\n", m.SourceSHA256)
 	}
@@ -2230,6 +2377,7 @@ func extractLibsFromFile(pkg repo.PkgInfo, pkgFile, soname, libsDir string) (nam
 		}
 
 		dst := filepath.Join(libsDir, rel)
+		var storePath string
 		if privateFile {
 			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 				return
@@ -2239,7 +2387,8 @@ func extractLibsFromFile(pkg repo.PkgInfo, pkgFile, soname, libsDir string) (nam
 			}
 			private = append(private, rel)
 		} else {
-			storePath, err := store.StoreWithMode(data, srcMode)
+			var err error
+			storePath, err = store.StoreWithMode(data, srcMode)
 			if err != nil {
 				return
 			}
@@ -2249,6 +2398,33 @@ func extractLibsFromFile(pkg repo.PkgInfo, pkgFile, soname, libsDir string) (nam
 			store.Symlink(storePath, dst)
 		}
 		names = append(names, rel)
+
+		// Co-shipped private libs (e.g. libpulse's
+		// pulseaudio/libpulsecommon-17.0.so, needed by libpulse.so via its
+		// own RUNPATH) live in a subdir the file index deliberately does
+		// not map — indexing them would shadow the real top-level
+		// provider. The loader, after patchPrivateLibs rewrites the
+		// parent's RUNPATH to $ORIGIN, finds only top-level siblings, so
+		// alias the subdir object to top-level. The next BFS frontier then
+		// finds it already staged instead of failing with "no provider".
+		if strings.Contains(rel, string(filepath.Separator)) {
+			base := filepath.Base(rel)
+			if strings.Contains(base, ".so") && !seenRel[base] {
+				top := filepath.Join(libsDir, base)
+				if _, err := os.Lstat(top); err != nil {
+					seenRel[base] = true
+					if privateFile {
+						if err := os.WriteFile(top, data, srcMode.Perm()&0777); err == nil {
+							private = append(private, base)
+							names = append(names, base)
+						}
+					} else {
+						store.Symlink(storePath, top)
+						names = append(names, base)
+					}
+				}
+			}
+		}
 	}
 
 	filepath.WalkDir(libDir, func(path string, d os.DirEntry, werr error) error {

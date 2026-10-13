@@ -429,6 +429,7 @@ func nextCompatibleVersion(pkgName string, skip map[string]bool, opts InstallOpt
 		if compatible {
 			return ver, nil
 		}
+		opts.printf("  [glibc-compat] %s needs newer glibc, trying older\n", ver)
 	}
 	return "", fmt.Errorf("no archived build of %s runs on this host's glibc (host %s); try --pkg-version <older> manually or --no-glibc-compat to force live latest",
 		pkgName, hostStr)
@@ -445,6 +446,7 @@ func autoGlibcVersion(pkgName string, opts InstallOptions) (string, bool) {
 	if !hostOK {
 		return "", false
 	}
+	opts.printf("Checking live %s against host glibc (downloading)...\n", pkgName)
 	data, info, err := repo.Default().DownloadAppPackage(pkgName, "")
 	if err != nil {
 		return "", false

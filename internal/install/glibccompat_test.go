@@ -155,3 +155,22 @@ func TestVersionsFromListing(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatBytes(t *testing.T) {
+	for _, tc := range []struct {
+		n    int
+		want string
+	}{
+		{0, "0 B"},
+		{512, "512 B"},
+		{1023, "1023 B"},
+		{1024, "1 KiB"},
+		{1536, "2 KiB"},
+		{1048576, "1.0 MiB"},
+		{123456789, "117.7 MiB"},
+	} {
+		if got := formatBytes(tc.n); got != tc.want {
+			t.Errorf("formatBytes(%d) = %q, want %q", tc.n, got, tc.want)
+		}
+	}
+}
