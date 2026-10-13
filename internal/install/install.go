@@ -1,9 +1,9 @@
 package install
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -569,7 +569,7 @@ func installDir(absDir, name string, opts InstallOptions) error {
 	mainPatched := false
 	patched := 0
 	for _, p := range stagedELFs {
-		if isStaticELF(p) {
+		if elf.IsStatic(p) {
 			continue // statically linked: loads nothing, patchelf N/A
 		}
 		if sameFile(p, stagedMain) {
@@ -882,7 +882,9 @@ func stageLocalLib(soname, src, libsDir string) (names, private []string, err er
 	if err != nil {
 		return nil, nil, err
 	}
-	store.Symlink(storePath, dst)
+	if err := store.Symlink(storePath, dst); err != nil {
+		return nil, nil, err
+	}
 	return []string{soname}, nil, nil
 }
 
@@ -1358,7 +1360,7 @@ func resolveStageCompat(roots []string, toResolve []string, libsDir string, loca
 			if hostTooOld(problems, libsDir) {
 				msg += "\n" + hostTooOldHint(opts.NoGlibcCompat)
 			}
-			return nil, nil, nil, fmt.Errorf("%s", msg)
+			return nil, nil, nil, errors.New(msg)
 		}
 		for _, s := range heal {
 			forced[s] = true
@@ -2336,17 +2338,13 @@ func extractLibsFromFile(pkg repo.PkgInfo, pkgFile, soname, libsDir string) (nam
 		return nil, nil, err
 	}
 
-	extract := exec.Command("bsdtar", "-xf", pkgFile, "-C", tmpDir, "usr/lib/")
-	var extractOut bytes.Buffer
-	extract.Stdout = &extractOut
-	extract.Stderr = &extractOut
-	if err := extract.Run(); err != nil {
+	if out, err := runBsdtarExtract(pkgFile, tmpDir, "usr/lib/"); err != nil {
 		// bsdtar reports "delayed" errors (e.g. hard links pointing outside
 		// the extracted usr/lib subset, as in Arch's glibc package) via
 		// its exit status while still extracting everything else: warn and
 		// continue. A genuinely broken package fails below when its soname
 		// is missing from the tree.
-		if s := strings.TrimSpace(extractOut.String()); s != "" {
+		if s := strings.TrimSpace(out); s != "" {
 			fmt.Printf("  [warn] bsdtar %s: %s\n", pkg.Name, s)
 		}
 	}
@@ -2395,7 +2393,9 @@ func extractLibsFromFile(pkg repo.PkgInfo, pkgFile, soname, libsDir string) (nam
 			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 				return
 			}
-			store.Symlink(storePath, dst)
+			if err := store.Symlink(storePath, dst); err != nil {
+				return
+			}
 		}
 		names = append(names, rel)
 
@@ -2419,7 +2419,9 @@ func extractLibsFromFile(pkg repo.PkgInfo, pkgFile, soname, libsDir string) (nam
 							names = append(names, base)
 						}
 					} else {
-						store.Symlink(storePath, top)
+						if err := store.Symlink(storePath, top); err != nil {
+							return
+						}
 						names = append(names, base)
 					}
 				}
@@ -2462,13 +2464,9 @@ func extractLibsFromFile(pkg repo.PkgInfo, pkgFile, soname, libsDir string) (nam
 	return names, private, nil
 }
 
-// isStaticELF reports whether path is a statically linked ELF (no
-// .dynamic section): it loads no shared libraries, so there is nothing to
-// isolate and patchelf cannot rewrite it. Such files are skipped, not failed.
-func isStaticELF(path string) bool {
-	return elf.IsStatic(path)
-}
-
+// hasELFMagic is a cheap header pre-filter used on hot walks before the
+// full debug/elf parse: 4-byte read vs elf.Open. elf.IsELF is the precise
+// check used for entrypoint validation.
 func hasELFMagic(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
@@ -2695,8 +2693,18 @@ func patchelfRPATH(binary, rpath string) error {
 	return cmd.Run()
 }
 
+// runBsdtarExtract runs `bsdtar -xf pkgFile -C dst` plus extra args,
+// returning combined output for callers to report. Callers decide whether a
+// non-zero exit warns-and-continues (subset extraction) or fails.
+func runBsdtarExtract(pkgFile, dst string, extra ...string) (string, error) {
+	args := append([]string{"-xf", pkgFile, "-C", dst}, extra...)
+	out, err := exec.Command("bsdtar", args...).CombinedOutput()
+	return string(out), err
+}
+
 // copyFile preserves the source mode (masked to 0777) and never propagates
-// setuid/setgid bits.
+// setuid/setgid bits. Distinct from repo.copyFile, which handles
+// non-executable cache blobs; this one stages executable payload files.
 func copyFile(dst, src string) error {
 	fi, err := os.Stat(src)
 	if err != nil {

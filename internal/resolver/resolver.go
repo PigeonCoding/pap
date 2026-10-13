@@ -107,7 +107,16 @@ func BuildSkipLibs(arch string) map[string]bool {
 // Refresh rebuilds SkipLibs from the current config.Arch (call after
 // config.Refresh in tests).
 func Refresh() {
+	ResetLDConfigCache()
 	SkipLibs = BuildSkipLibs(config.Arch)
+}
+
+// ResetLDConfigCache drops the memoized `ldconfig -p` result so the next
+// lookup re-probes the host. Tests call it via Refresh; production code
+// never needs it (ldconfig output is stable per process).
+func ResetLDConfigCache() {
+	ldconfigOnce = sync.Once{}
+	ldconfigCache = nil
 }
 
 // Skip reports whether soname is host-provided (kernel vdso, loader,

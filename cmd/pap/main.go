@@ -51,36 +51,20 @@ func main() {
 		a := args[i]
 		if a == "--archive-date" {
 			i++
-			if i >= len(args) || strings.HasPrefix(args[i], "-") {
-				fmt.Fprintf(os.Stderr, "--archive-date requires a value: --archive-date YYYY-MM-DD (run `pap help install`)\n")
-				os.Exit(1)
-			}
-			archiveDate = args[i]
+			archiveDate = requireFlagValue(args, i, "--archive-date", "--archive-date YYYY-MM-DD")
 			continue
 		}
 		if v, ok := strings.CutPrefix(a, "--archive-date="); ok {
-			if v == "" {
-				fmt.Fprintf(os.Stderr, "--archive-date requires a value: --archive-date YYYY-MM-DD (run `pap help install`)\n")
-				os.Exit(1)
-			}
-			archiveDate = v
+			archiveDate = requireInlineValue(v, "--archive-date", "--archive-date YYYY-MM-DD")
 			continue
 		}
 		if a == "--pkg-version" {
 			i++
-			if i >= len(args) || strings.HasPrefix(args[i], "-") {
-				fmt.Fprintf(os.Stderr, "--pkg-version requires a value: --pkg-version <pkgver> (run `pap help install`)\n")
-				os.Exit(1)
-			}
-			pkgVersion = args[i]
+			pkgVersion = requireFlagValue(args, i, "--pkg-version", "--pkg-version <pkgver>")
 			continue
 		}
 		if v, ok := strings.CutPrefix(a, "--pkg-version="); ok {
-			if v == "" {
-				fmt.Fprintf(os.Stderr, "--pkg-version requires a value: --pkg-version <pkgver> (run `pap help install`)\n")
-				os.Exit(1)
-			}
-			pkgVersion = v
+			pkgVersion = requireInlineValue(v, "--pkg-version", "--pkg-version <pkgver>")
 			continue
 		}
 		switch a {
@@ -220,6 +204,25 @@ func main() {
 func fail(err error) {
 	fmt.Fprintf(os.Stderr, "error: %v\n", err)
 	os.Exit(1)
+}
+
+// requireFlagValue returns args[idx] for a space-separated flag, exiting when
+// missing or flag-shaped.
+func requireFlagValue(args []string, idx int, flag, hint string) string {
+	if idx >= len(args) || strings.HasPrefix(args[idx], "-") {
+		fmt.Fprintf(os.Stderr, "%s requires a value: %s (run `pap help install`)\n", flag, hint)
+		os.Exit(1)
+	}
+	return args[idx]
+}
+
+// requireInlineValue validates a --flag=value form, exiting on empty.
+func requireInlineValue(v, flag, hint string) string {
+	if v == "" {
+		fmt.Fprintf(os.Stderr, "%s requires a value: %s (run `pap help install`)\n", flag, hint)
+		os.Exit(1)
+	}
+	return v
 }
 
 // validPkgName rejects empty names and path/flag-shaped input for the

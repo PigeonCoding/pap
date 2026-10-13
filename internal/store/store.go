@@ -71,7 +71,7 @@ func StoreWithMode(data []byte, mode os.FileMode) (string, error) {
 }
 
 func Symlink(storePath, linkPath string) error {
-	os.Remove(linkPath)
+	_ = os.Remove(linkPath) // linkPath may not exist; Remove error is irrelevant
 	return os.Symlink(storePath, linkPath)
 }
 
@@ -111,7 +111,7 @@ func ScanUsed() map[string]bool {
 			continue
 		}
 		libsDir := filepath.Join(config.AppsDir, app.Name(), "libs")
-		filepath.WalkDir(libsDir, func(path string, d os.DirEntry, err error) error {
+		_ = filepath.WalkDir(libsDir, func(path string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
 				return nil
 			}

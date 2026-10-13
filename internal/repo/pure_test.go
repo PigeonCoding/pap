@@ -2,15 +2,14 @@ package repo
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 )
 
 func TestProvideToSoname(t *testing.T) {
 	cases := []struct {
-		in      string
-		want    string
-		wantOK  bool
+		in     string
+		want   string
+		wantOK bool
 	}{
 		{"libcurl.so=4-64", "libcurl.so.4", true},
 		{"libz.so=1-64", "libz.so.1", true},
@@ -63,8 +62,6 @@ func TestParseProvides(t *testing.T) {
 
 func TestPkgURLAndFileName(t *testing.T) {
 	idx := &Index{cacheDir: t.TempDir()}
-	def := repoDef{name: "core", servers: []string{"https://mirror.example/$repo/os/$arch"}}
-	_ = def
 	pkg := PkgInfo{Repo: "core", Name: "curl", Version: "8.22.0-1", Arch: "x86_64", Filename: "curl-8.22.0-1-x86_64.pkg.tar.zst"}
 	url := idx.pkgURL("https://mirror.example/$repo/os/$arch", pkg)
 	want := "https://mirror.example/core/os/x86_64/curl-8.22.0-1-x86_64.pkg.tar.zst"
@@ -103,5 +100,4 @@ func TestOrderedServers(t *testing.T) {
 	if got := idx.orderedServers(def); len(got) != 2 || got[0] != def.servers[0] {
 		t.Fatalf("stale pin: orderedServers = %v", got)
 	}
-	_ = filepath.Separator
 }

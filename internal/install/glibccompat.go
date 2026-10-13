@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -419,9 +418,8 @@ func nextCompatibleVersion(pkgName string, skip map[string]bool, opts InstallOpt
 		if merr := os.MkdirAll(payload, 0755); merr == nil {
 			pkgFile := filepath.Join(work, "app.pkg.tar.zst")
 			if werr := os.WriteFile(pkgFile, data, 0644); werr == nil {
-				if out, xerr := exec.Command("bsdtar", "-xf", pkgFile, "-C", payload).CombinedOutput(); xerr == nil {
+				if _, xerr := runBsdtarExtract(pkgFile, payload); xerr == nil {
 					compatible, _, _, _ = PayloadHostCompatible(payload)
-					_ = out
 				}
 			}
 		}
@@ -464,9 +462,9 @@ func autoGlibcVersion(pkgName string, opts InstallOptions) (string, bool) {
 	if err := os.WriteFile(pkgFile, data, 0644); err != nil {
 		return "", false
 	}
-	if out, err := exec.Command("bsdtar", "-xf", pkgFile, "-C", payload).CombinedOutput(); err != nil {
+	if out, err := runBsdtarExtract(pkgFile, payload); err != nil {
 		opts.printf("warning: cannot inspect live %s %s (%v: %s); proceeding without glibc check\n",
-			pkgName, info.Version, err, strings.TrimSpace(string(out)))
+			pkgName, info.Version, err, strings.TrimSpace(out))
 		return "", false
 	}
 	if ok, _, _, _ := PayloadHostCompatible(payload); ok {

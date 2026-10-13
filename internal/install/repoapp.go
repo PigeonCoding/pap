@@ -3,7 +3,6 @@ package install
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -103,7 +102,7 @@ func InstallRepoApp(pkgName, version, name string, opts InstallOptions) error {
 			return merr
 		}
 		opts.printf("Extracting package...\n")
-		if out, xerr := exec.Command("bsdtar", "-xf", pkgFile, "-C", payload).CombinedOutput(); xerr != nil {
+		if out, xerr := runBsdtarExtract(pkgFile, payload); xerr != nil {
 			os.RemoveAll(work)
 			return fmt.Errorf("extract %s %s: %w: %s", info.Name, info.Version, xerr, out)
 		}
@@ -168,7 +167,7 @@ func findRepoMainExe(payload, pkgName, appName string) (string, error) {
 		filepath.Join("usr", "sbin", pkgName),
 	} {
 		p := filepath.Join(payload, rel)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&execBitMask != 0 {
 			if elf.IsELF(p) || elf.IsScript(p) {
 				return rel, nil
 			}
@@ -191,7 +190,7 @@ func findRepoMainExe(payload, pkgName, appName string) (string, error) {
 				}
 				p := filepath.Join(root, e.Name())
 				st, err := os.Stat(p)
-				if err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+				if err != nil || st.IsDir() || st.Mode()&execBitMask == 0 {
 					continue
 				}
 				if isELF := elf.IsELF(p); isELF != wantELF {

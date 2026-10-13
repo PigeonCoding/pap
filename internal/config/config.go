@@ -79,17 +79,19 @@ func Refresh() {
 }
 
 var (
-	BaseDir      = Resolve().BaseDir
-	AppsDir      = Resolve().AppsDir
-	ExeDir       = Resolve().ExeDir
-	StoreDir     = Resolve().StoreDir
-	PkgCacheDir  = Resolve().PkgCacheDir
-	CacheDir     = Resolve().CacheDir
-	RepoCacheDir = Resolve().RepoCacheDir
-	Mirrorlist   = Resolve().Mirrorlist
-	BinDir       = Resolve().BinDir
-	LockFile     = Resolve().LockFile
-	Arch         = Resolve().Arch
+	defaults = Resolve()
+
+	BaseDir      = defaults.BaseDir
+	AppsDir      = defaults.AppsDir
+	ExeDir       = defaults.ExeDir
+	StoreDir     = defaults.StoreDir
+	PkgCacheDir  = defaults.PkgCacheDir
+	CacheDir     = defaults.CacheDir
+	RepoCacheDir = defaults.RepoCacheDir
+	Mirrorlist   = defaults.Mirrorlist
+	BinDir       = defaults.BinDir
+	LockFile     = defaults.LockFile
+	Arch         = defaults.Arch
 )
 
 func baseDir() string {

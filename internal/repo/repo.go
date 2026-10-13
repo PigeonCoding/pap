@@ -382,9 +382,13 @@ func (idx *Index) Load() error {
 		return nil
 	}
 
-	os.MkdirAll(idx.cacheDir, 0755)
+	if err := os.MkdirAll(idx.cacheDir, 0755); err != nil {
+		return fmt.Errorf("create cache dir: %w", err)
+	}
 	if idx.pkgCacheDir != "" {
-		os.MkdirAll(idx.pkgCacheDir, 0755)
+		if err := os.MkdirAll(idx.pkgCacheDir, 0755); err != nil {
+			return fmt.Errorf("create package cache dir: %w", err)
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -493,7 +497,9 @@ func (idx *Index) fetchIndex(def repoDef, kind string) error {
 			continue
 		}
 		if kind == "db" {
-			os.WriteFile(idx.serverFile(def.name), []byte(srv), 0644)
+			if err := os.WriteFile(idx.serverFile(def.name), []byte(srv), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: record mirror for %s: %v\n", def.name, err)
+			}
 		}
 		return nil
 	}
@@ -1174,6 +1180,9 @@ func verifyFileSHA256(path, want string) (bool, error) {
 	return hex.EncodeToString(h.Sum(nil)) == want, nil
 }
 
+// copyFile streams src to dst atomically (temp + rename, 0644 cache files).
+// Distinct from install.copyFile, which preserves executable source modes for
+// staged payloads; this one is only for package-cache blobs.
 func copyFile(dst, src string) error {
 	in, err := os.Open(src)
 	if err != nil {

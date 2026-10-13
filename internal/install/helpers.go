@@ -26,6 +26,17 @@ import (
 // host stays on the host, and anything already shipped in the payload is
 // left alone. Whatever survives all three filters is fetched.
 
+const (
+	execBitMask   = 0o111
+	maxScriptSize = 1 << 20 // scripts larger than this are never scanned
+)
+
+// isExecScriptCandidate reports whether mode/size qualify a file for script
+// scanning. ELF-magic and NUL-byte checks happen after, on content.
+func isExecScriptCandidate(mode os.FileMode, size int64) bool {
+	return mode.Perm()&execBitMask != 0 && size <= maxScriptSize
+}
+
 var (
 	execLeadRe   = regexp.MustCompile(`(?:^\s*|[;&|(){]\s*)(exec|command)\s+(.*)$`)
 	subshellRe   = regexp.MustCompile(`\$\(\s*([A-Za-z][A-Za-z0-9._+-]*)`)
@@ -65,7 +76,7 @@ func scanExecRefs(root string) []string {
 		if err != nil {
 			return nil
 		}
-		if fi.Mode().Perm()&0111 == 0 || fi.Size() > 1<<20 {
+		if !isExecScriptCandidate(fi.Mode(), fi.Size()) {
 			return nil
 		}
 		if hasELFMagic(path) {
@@ -345,10 +356,10 @@ func vendorOneHelper(plan helperPlan, stagedRoot string, opts InstallOptions) (a
 	if err := os.MkdirAll(tmp, 0755); err != nil {
 		return nil, nil, "", err
 	}
-	if out, xerr := exec.Command("bsdtar", "-xf", pkgFile, "-C", tmp).CombinedOutput(); xerr != nil {
+	if out, xerr := runBsdtarExtract(pkgFile, tmp); xerr != nil {
 		// Same tolerance as dependency extraction: links pointing outside
 		// the extracted set warn but rarely matter for the staged subset.
-		if s := strings.TrimSpace(string(out)); s != "" {
+		if s := strings.TrimSpace(out); s != "" {
 			opts.printf("  [warn] bsdtar %s: %s\n", plan.pkg.Name, s)
 		}
 	}
@@ -367,7 +378,7 @@ func vendorOneHelper(plan helperPlan, stagedRoot string, opts InstallOptions) (a
 			}
 			src := filepath.Join(srcDir, e.Name())
 			fi, serr := os.Lstat(src)
-			if serr != nil || !fi.Mode().IsRegular() || fi.Mode().Perm()&0111 == 0 {
+			if serr != nil || !fi.Mode().IsRegular() || fi.Mode().Perm()&execBitMask == 0 {
 				continue
 			}
 			dst := filepath.Join(stagedRoot, "usr", cls, e.Name())
@@ -589,7 +600,7 @@ func rewriteStagedRefs(stagedRoot, name string, opts InstallOptions) error {
 		if err != nil {
 			return nil
 		}
-		if fi.Mode().Perm()&0111 == 0 || fi.Size() > 1<<20 {
+		if !isExecScriptCandidate(fi.Mode(), fi.Size()) {
 			return nil
 		}
 		if hasELFMagic(path) {
